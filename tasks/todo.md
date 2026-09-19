@@ -143,7 +143,7 @@
 
 ## Task 6: cmd/api wiring, config, graceful shutdown
 
-**Description:** Composition root. `config` package reads/validates env (`PORT`, `MONGODB_URI`, `MONGODB_DB`, `MONGODB_COLLECTION`, `MAX_UPLOAD_BYTES`, `EXTRACTION_TIMEOUT`, `CONCURRENCY`, `ERR_BASE_URL`). `main.go` wires fitz adapter → use case → router, starts the server (fixed `ReadHeaderTimeout`, no blocking `ReadTimeout`), and shuts down gracefully on SIGINT/SIGTERM (server `Shutdown` + mongo `Disconnect` with bounded ctx).
+**Description:** Composition root. `config` package reads/validates env (`PORT`, `MONGODB_URI`, `MONGODB_DB`, `MONGODB_COLLECTION`, `MAX_UPLOAD_MB`, `EXTRACTION_TIMEOUT`, `CONCURRENCY`, `MAX_IN_FLIGHT`, `ERR_BASE_URL`). `main.go` wires fitz adapter → use case → router, starts the server (fixed `ReadHeaderTimeout`, no blocking `ReadTimeout`), and shuts down gracefully on SIGINT/SIGTERM (server `Shutdown` + mongo `Disconnect` with bounded ctx).
 
 **Acceptance criteria:**
 - [ ] Config validates required vars, applies documented defaults, and errors with a clear message on bad values

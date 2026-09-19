@@ -15,6 +15,8 @@ type Config struct {
 	MongoDB         string
 	MongoCollection string
 
+	// MaxUploadBytes caps the accepted multipart upload size, expressed in
+	// bytes internally. The MAX_UPLOAD_MB env var configures it in megabytes.
 	MaxUploadBytes    int64
 	ExtractionTimeout time.Duration
 	// Concurrency bounds simultaneous extractions; 0 falls back to NumCPU.
@@ -54,12 +56,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MONGODB_URI is required")
 	}
 
-	if raw := os.Getenv("MAX_UPLOAD_BYTES"); raw != "" {
+	if raw := os.Getenv("MAX_UPLOAD_MB"); raw != "" {
 		v, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("MAX_UPLOAD_BYTES must be a positive integer, got %q", raw)
+			return nil, fmt.Errorf("MAX_UPLOAD_MB must be a positive integer of megabytes (e.g. 25), got %q", raw)
 		}
-		cfg.MaxUploadBytes = v
+		cfg.MaxUploadBytes = v * 1024 * 1024
 	}
 
 	if raw := os.Getenv("EXTRACTION_TIMEOUT"); raw != "" {

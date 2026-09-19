@@ -10,7 +10,7 @@ import (
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"PORT", "MONGODB_URI", "MONGODB_DB", "MONGODB_COLLECTION", "MAX_UPLOAD_BYTES", "EXTRACTION_TIMEOUT", "CONCURRENCY", "MAX_IN_FLIGHT", "ERR_BASE_URL"} {
+	for _, k := range []string{"PORT", "MONGODB_URI", "MONGODB_DB", "MONGODB_COLLECTION", "MAX_UPLOAD_MB", "EXTRACTION_TIMEOUT", "CONCURRENCY", "MAX_IN_FLIGHT", "ERR_BASE_URL"} {
 		t.Setenv(k, "")
 	}
 }
@@ -55,7 +55,7 @@ func TestLoad_RespectsOverrides(t *testing.T) {
 	t.Setenv("MONGODB_DB", "custom_db")
 	t.Setenv("MONGODB_COLLECTION", "custom_col")
 	t.Setenv("PORT", "9090")
-	t.Setenv("MAX_UPLOAD_BYTES", "1048576")
+	t.Setenv("MAX_UPLOAD_MB", "2")
 	t.Setenv("EXTRACTION_TIMEOUT", "5s")
 	t.Setenv("CONCURRENCY", "4")
 	t.Setenv("MAX_IN_FLIGHT", "16")
@@ -65,7 +65,7 @@ func TestLoad_RespectsOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Port != "9090" || cfg.MongoDB != "custom_db" || cfg.MongoCollection != "custom_col" || cfg.MaxUploadBytes != 1048576 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.MaxInFlight != 16 || cfg.ErrBaseURL != "https://errors.acme.dev" {
+	if cfg.Port != "9090" || cfg.MongoDB != "custom_db" || cfg.MongoCollection != "custom_col" || cfg.MaxUploadBytes != 2*1024*1024 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.MaxInFlight != 16 || cfg.ErrBaseURL != "https://errors.acme.dev" {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 }
@@ -88,14 +88,14 @@ func TestLoad_InvalidValues(t *testing.T) {
 		want string
 	}{
 		{
-			name: "invalid MAX_UPLOAD_BYTES",
-			env:  map[string]string{"MAX_UPLOAD_BYTES": "abc"},
-			want: "MAX_UPLOAD_BYTES",
+			name: "invalid MAX_UPLOAD_MB",
+			env:  map[string]string{"MAX_UPLOAD_MB": "abc"},
+			want: "MAX_UPLOAD_MB",
 		},
 		{
-			name: "negative MAX_UPLOAD_BYTES",
-			env:  map[string]string{"MAX_UPLOAD_BYTES": "-5"},
-			want: "MAX_UPLOAD_BYTES",
+			name: "negative MAX_UPLOAD_MB",
+			env:  map[string]string{"MAX_UPLOAD_MB": "-5"},
+			want: "MAX_UPLOAD_MB",
 		},
 		{
 			name: "invalid EXTRACTION_TIMEOUT",
