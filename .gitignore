@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Local build artifact
+bin/
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -28,5 +31,5 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
