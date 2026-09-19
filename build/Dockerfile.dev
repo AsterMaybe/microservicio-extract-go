@@ -1,0 +1,9 @@
+FROM golang:1.27.1-bookworm
+
+# go-fitz ships precompiled MuPDF static libs; only a C compiler is
+# needed to build its small cgo shims. Dev/CI convenience image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work

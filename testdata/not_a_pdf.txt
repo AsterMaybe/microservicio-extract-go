@@ -1,0 +1,3 @@
+This is definitely not a PDF document. It is a plain text file pretending
+to be something it is not. MuPDF should reject it immediately.
+%PDF-1.4 1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj

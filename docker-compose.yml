@@ -1,0 +1,73 @@
+# Microservicio Go (extracción de PDF) — se publica únicamente a través de
+# Traefik (misma infraestructura que pdfextract). No publica puertos: todo el
+# tráfico entra por el gateway vía labels.
+# Proyecto aislado: evita que `docker compose up` de otra ficha borre los
+# contenedores de las demás (todas comparten la red externa).
+name: microservicio-go
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: microservicio-api:0.1.0
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      # Credenciales/red compartidas con pdfextract (mongo corre en esta red).
+      - MONGODB_URI=mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-password}@mongo:27017
+      # Colección propia: no reutilices `extracted_texts` (schema del monolito).
+      - MONGODB_DB=${GO_MONGODB_DB:-pdf_extraction}
+      - MONGODB_COLLECTION=${GO_MONGODB_COLLECTION:-extractions}
+      - GIN_MODE=${GIN_MODE:-release}
+      # Tamaño máximo de PDF en MB (default 25).
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-25}
+      # Admission control: subidas simultáneas en RAM antes de la extracción.
+      - MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-32}
+    labels:
+      - "traefik.enable=true"
+      # Red que Traefik debe usar para alcanzar este contenedor (la interpola compose).
+      - "traefik.docker.network=${SHARED_NETWORK_NAME:-test_network}"
+      # Router HTTP sobre un host propio: el monolito (miapp) ya ocupa
+      # api.localhost, así que no pisar sus rutas.
+      - "traefik.http.routers.go-extract.rule=Host(`${MICROSERVICE_HOST:-extract.localhost}`)"
+      - "traefik.http.routers.go-extract.entrypoints=web"
+      - "traefik.http.routers.go-extract.service=go-extract"
+      # Middlewares propios del microservicio. `go-errors` va PRIMERO
+      # (outermost) para poder capturar el 429 del rate-limit y el 503 del
+      # circuit-breaker; si fuera el último, la respuesta de error no pasaría
+      # nunca por él. No reutiliza los middlewares de miapp: los límites y el
+      # destino del error son por-servicio.
+      - "traefik.http.routers.go-extract.middlewares=go-errors,go-ratelimit,go-cb"
+      # Rate limit (bucket propio, no compartido con el monolito).
+      - "traefik.http.middlewares.go-ratelimit.ratelimit.average=300"
+      - "traefik.http.middlewares.go-ratelimit.ratelimit.burst=100"
+      # Circuit breaker propio.
+      - "traefik.http.middlewares.go-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.33"
+      # Errors (RFC 9457): delega 429/503 a este mismo servicio para que
+      # responda problem+json en lugar del texto plano por defecto.
+      - "traefik.http.middlewares.go-errors.errors.status=429,503"
+      - "traefik.http.middlewares.go-errors.errors.query=/traefik/errors/{status}"
+      - "traefik.http.middlewares.go-errors.errors.service=go-extract"
+      # Servicio, puerto interno y healthcheck de balanceo. Nuestro /health no
+      # valida el Host, así que las sondas de Traefik responden 200.
+      - "traefik.http.services.go-extract.loadbalancer.server.port=8080"
+      - "traefik.http.services.go-extract.loadbalancer.healthcheck.path=/api/v1/health"
+      - "traefik.http.services.go-extract.loadbalancer.healthcheck.interval=10s"
+      - "traefik.http.services.go-extract.loadbalancer.healthcheck.timeout=3s"
+    # Healthcheck de Docker: el contenedor se marca unhealthy si el servicio no
+    # responde localmente (independiente del gateway).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - shared-network
+
+networks:
+  shared-network:
+    name: ${SHARED_NETWORK_NAME:-test_network}
+    external: true
