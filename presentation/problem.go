@@ -14,6 +14,9 @@ import (
 const (
 	problemTypeTooLarge           = "too-large"
 	problemTypeServiceUnavailable = "service-unavailable"
+	// problemTypeBusy is returned when the in-flight upload admission limit is
+	// exhausted: the service fails fast before buffering more uploads in RAM.
+	problemTypeBusy = "busy"
 )
 
 type problemDefinition struct {
@@ -54,6 +57,11 @@ var problemRegistry = map[string]problemDefinition{
 		status: http.StatusServiceUnavailable,
 		title:  "Service Unavailable",
 		detail: "A required dependency (e.g. the database) is currently unreachable.",
+	},
+	problemTypeBusy: {
+		status: http.StatusServiceUnavailable,
+		title:  "Service Busy",
+		detail: "The service is at capacity; retry the request later.",
 	},
 }
 

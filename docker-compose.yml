@@ -21,6 +21,8 @@ services:
       - MONGODB_DB=${GO_MONGODB_DB:-pdf_extraction}
       - MONGODB_COLLECTION=${GO_MONGODB_COLLECTION:-extractions}
       - GIN_MODE=${GIN_MODE:-release}
+      # Admission control: subidas simultáneas en RAM antes de la extracción.
+      - MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-32}
     labels:
       - "traefik.enable=true"
       # Red que Traefik debe usar para alcanzar este contenedor (la interpola compose).

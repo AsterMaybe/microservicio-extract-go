@@ -19,6 +19,10 @@ type Config struct {
 	ExtractionTimeout time.Duration
 	// Concurrency bounds simultaneous extractions; 0 falls back to NumCPU.
 	Concurrency int
+	// MaxInFlight bounds simultaneous uploads being buffered by HTTP handlers
+	// *before* extraction. Saturation returns an RFC 9457 503 instead of
+	// unbounded in-memory buffering.
+	MaxInFlight int
 	ErrBaseURL  string
 }
 
@@ -28,6 +32,7 @@ const (
 	defaultCollection        = "extractions"
 	defaultMaxUploadBytes    = 25 * 1024 * 1024
 	defaultExtractionTimeout = 30 * time.Second
+	defaultMaxInFlight       = 32
 	defaultErrBaseURL        = "https://errors.example.com"
 )
 
@@ -41,6 +46,7 @@ func Load() (*Config, error) {
 		MongoCollection:   getEnv("MONGODB_COLLECTION", defaultCollection),
 		MaxUploadBytes:    defaultMaxUploadBytes,
 		ExtractionTimeout: defaultExtractionTimeout,
+		MaxInFlight:       defaultMaxInFlight,
 		ErrBaseURL:        getEnv("ERR_BASE_URL", defaultErrBaseURL),
 	}
 
@@ -70,6 +76,14 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("CONCURRENCY must be a positive integer (or unset for CPU count), got %q", raw)
 		}
 		cfg.Concurrency = v
+	}
+
+	if raw := os.Getenv("MAX_IN_FLIGHT"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("MAX_IN_FLIGHT must be a positive integer (or unset for the default), got %q", raw)
+		}
+		cfg.MaxInFlight = v
 	}
 
 	if raw := os.Getenv("ERR_BASE_URL"); raw != "" {

@@ -45,6 +45,7 @@ func run() error {
 		ErrBaseURL:        cfg.ErrBaseURL,
 		MaxUploadBytes:    cfg.MaxUploadBytes,
 		ExtractionTimeout: cfg.ExtractionTimeout,
+		MaxInFlight:       cfg.MaxInFlight,
 	})
 
 	srv := &http.Server{

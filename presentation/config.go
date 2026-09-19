@@ -10,4 +10,7 @@ type Config struct {
 	MaxUploadBytes int64
 	// ExtractionTimeout bounds a single extraction, including queue wait.
 	ExtractionTimeout time.Duration
+	// MaxInFlight bounds simultaneous uploads buffered by handlers. Zero falls
+	// back to a safe default (see Handler).
+	MaxInFlight int
 }

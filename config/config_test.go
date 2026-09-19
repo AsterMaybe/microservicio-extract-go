@@ -10,7 +10,7 @@ import (
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"PORT", "MONGODB_URI", "MONGODB_DB", "MONGODB_COLLECTION", "MAX_UPLOAD_BYTES", "EXTRACTION_TIMEOUT", "CONCURRENCY", "ERR_BASE_URL"} {
+	for _, k := range []string{"PORT", "MONGODB_URI", "MONGODB_DB", "MONGODB_COLLECTION", "MAX_UPLOAD_BYTES", "EXTRACTION_TIMEOUT", "CONCURRENCY", "MAX_IN_FLIGHT", "ERR_BASE_URL"} {
 		t.Setenv(k, "")
 	}
 }
@@ -41,6 +41,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Concurrency != 0 { // 0 means "fall back to NumCPU in the use case"
 		t.Errorf("Concurrency = %d, want default 0", cfg.Concurrency)
 	}
+	if cfg.MaxInFlight != 32 {
+		t.Errorf("MaxInFlight = %d, want default 32", cfg.MaxInFlight)
+	}
 	if cfg.ErrBaseURL != "https://errors.example.com" {
 		t.Errorf("ErrBaseURL = %q, want default", cfg.ErrBaseURL)
 	}
@@ -55,13 +58,14 @@ func TestLoad_RespectsOverrides(t *testing.T) {
 	t.Setenv("MAX_UPLOAD_BYTES", "1048576")
 	t.Setenv("EXTRACTION_TIMEOUT", "5s")
 	t.Setenv("CONCURRENCY", "4")
+	t.Setenv("MAX_IN_FLIGHT", "16")
 	t.Setenv("ERR_BASE_URL", "https://errors.acme.dev")
 
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Port != "9090" || cfg.MongoDB != "custom_db" || cfg.MongoCollection != "custom_col" || cfg.MaxUploadBytes != 1048576 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.ErrBaseURL != "https://errors.acme.dev" {
+	if cfg.Port != "9090" || cfg.MongoDB != "custom_db" || cfg.MongoCollection != "custom_col" || cfg.MaxUploadBytes != 1048576 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.MaxInFlight != 16 || cfg.ErrBaseURL != "https://errors.acme.dev" {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 }
@@ -102,6 +106,11 @@ func TestLoad_InvalidValues(t *testing.T) {
 			name: "invalid CONCURRENCY",
 			env:  map[string]string{"CONCURRENCY": "-3"},
 			want: "CONCURRENCY",
+		},
+		{
+			name: "invalid MAX_IN_FLIGHT",
+			env:  map[string]string{"MAX_IN_FLIGHT": "abc"},
+			want: "MAX_IN_FLIGHT",
 		},
 		{
 			name: "invalid ERR_BASE_URL",

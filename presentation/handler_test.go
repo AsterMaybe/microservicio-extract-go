@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,31 @@ type stubPinger struct {
 
 func (s *stubPinger) Ping(_ context.Context) error {
 	return s.err
+}
+
+// blockingExtractor holds the handler in-flight slot open for as long as
+// release is not closed, so admission saturation can be tested deterministically.
+type blockingExtractor struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingExtractor) Extract(ctx context.Context, _ application.ExtractInput) (application.ExtractOutput, error) {
+	b.once.Do(func() { close(b.entered) })
+	select {
+	case <-b.release:
+		return application.ExtractOutput{
+			Filename:   "a.pdf",
+			Extension:  "pdf",
+			MimeType:   "application/pdf",
+			Text:       "ok",
+			PageCount:  1,
+			TextLength: 2,
+		}, nil
+	case <-ctx.Done():
+		return application.ExtractOutput{}, ctx.Err()
+	}
 }
 
 func testConfig() presentation.Config {
@@ -154,6 +180,42 @@ func TestExtract_FileTooLarge_Returns413Problem(t *testing.T) {
 	}
 	if m["instance"] != "/api/v1/extract" {
 		t.Errorf("instance = %v, want path /api/v1/extract", m["instance"])
+	}
+}
+
+func TestExtract_Saturated_Returns503Problem(t *testing.T) {
+	ex := &blockingExtractor{entered: make(chan struct{}), release: make(chan struct{})}
+	cfg := testConfig()
+	cfg.MaxInFlight = 1
+	router := newTestRouter(t, ex, &stubPinger{}, cfg)
+
+	firstReq := uploadRequest(t, "/api/v1/extract", "a.pdf", []byte("%PDF-1.7\n"))
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, firstReq)
+		firstDone <- rec
+	}()
+	<-ex.entered // the first request is buffering and holds the only slot
+
+	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "b.pdf", []byte("%PDF-1.7\n")))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	m := decodeProblem(t, rec)
+	if !strings.HasSuffix(m["type"].(string), "/busy") {
+		t.Errorf("type = %v, want to end in /busy", m["type"])
+	}
+
+	close(ex.release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200 (%s)", first.Code, first.Body.String())
+	}
+
+	// Slot freed: a fresh request is admitted again.
+	rec2 := perform(t, router, uploadRequest(t, "/api/v1/extract", "c.pdf", []byte("%PDF-1.7\n")))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("status after release = %d, want 200 (%s)", rec2.Code, rec2.Body.String())
 	}
 }
 

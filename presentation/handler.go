@@ -32,15 +32,39 @@ type Handler struct {
 	extractor Extractor
 	pinger    Pinger
 	cfg       Config
+	// inflight admission-limits uploads being buffered. Acquired BEFORE
+	// FormFile/io.ReadAll so a burst cannot grow memory without bound; when it
+	// is full the handler fails fast with a 503 problem instead of queueing.
+	inflight chan struct{}
 }
 
+// defaultMaxInFlight bounds simultaneous upload buffers when the injected
+// Config leaves MaxInFlight unset.
+const defaultMaxInFlight = 32
+
 func NewHandler(extractor Extractor, pinger Pinger, cfg Config) *Handler {
-	return &Handler{extractor: extractor, pinger: pinger, cfg: cfg}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = defaultMaxInFlight
+	}
+	return &Handler{
+		extractor: extractor,
+		pinger:    pinger,
+		cfg:       cfg,
+		inflight:  make(chan struct{}, cfg.MaxInFlight),
+	}
 }
 
 // Extract handles POST /api/v1/extract.
 func (h *Handler) Extract(c *gin.Context) {
 	instance := c.Request.URL.Path
+
+	select {
+	case h.inflight <- struct{}{}:
+		defer func() { <-h.inflight }()
+	default:
+		writeProblem(c, h.cfg.ErrBaseURL, problemTypeBusy, instance)
+		return
+	}
 
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.cfg.MaxUploadBytes)
 
