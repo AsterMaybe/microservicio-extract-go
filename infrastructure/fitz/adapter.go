@@ -31,7 +31,7 @@ func (a *Adapter) ExtractText(ctx context.Context, data []byte) (string, int, er
 	if err != nil {
 		return "", 0, fmt.Errorf("open document: %w", domain.ErrMalformedDocument)
 	}
-	defer doc.Close()
+	defer func() { _ = doc.Close() }()
 
 	pages := doc.NumPage()
 	var sb strings.Builder

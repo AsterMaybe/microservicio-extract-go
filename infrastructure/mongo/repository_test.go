@@ -37,7 +37,7 @@ func dropCollection(t *testing.T, uri, db, col string) {
 	if err != nil {
 		t.Fatalf("connect for cleanup: %v", err)
 	}
-	defer client.Disconnect(ctx)
+	defer func() { _ = client.Disconnect(ctx) }()
 	if err := client.Database(db).Collection(col).Drop(ctx); err != nil {
 		t.Fatalf("drop test collection: %v", err)
 	}
@@ -49,7 +49,7 @@ func rawClient(t *testing.T, uri string) *mongo.Client {
 	if err != nil {
 		t.Fatalf("raw connect: %v", err)
 	}
-	t.Cleanup(func() { client.Disconnect(context.Background()) })
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 	return client
 }
 
@@ -62,7 +62,7 @@ func TestRepository_RoundTripPersistsFullRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepository: %v", err)
 	}
-	defer repo.Disconnect(context.Background())
+	defer func() { _ = repo.Disconnect(context.Background()) }()
 
 	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	rec := &domain.ExtractionRecord{
@@ -116,7 +116,7 @@ func TestRepository_SaveErrorRecord_PersistsErrorFacet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepository: %v", err)
 	}
-	defer repo.Disconnect(context.Background())
+	defer func() { _ = repo.Disconnect(context.Background()) }()
 
 	now := time.Now().UTC()
 	rec := &domain.ExtractionRecord{
@@ -150,7 +150,7 @@ func TestRepository_Ping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepository: %v", err)
 	}
-	defer repo.Disconnect(context.Background())
+	defer func() { _ = repo.Disconnect(context.Background()) }()
 	if err := repo.Ping(ctx); err != nil {
 		t.Errorf("Ping: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestRepository_EnforcesCreatedAtIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepository: %v", err)
 	}
-	defer repo.Disconnect(context.Background())
+	defer func() { _ = repo.Disconnect(context.Background()) }()
 
 	client := rawClient(t, uri)
 	cursor, err := client.Database(db).Collection(col).Indexes().List(ctx)
@@ -193,7 +193,7 @@ func TestRepository_FailsFastOnUnreachableInstance(t *testing.T) {
 	repo, err := mongorepo.NewRepository(ctx, "mongodb://127.0.0.1:59999", "", "")
 	if err == nil {
 		if repo != nil {
-			repo.Disconnect(context.Background())
+			_ = repo.Disconnect(context.Background())
 		}
 		t.Fatal("expected an error for an unreachable instance")
 	}
