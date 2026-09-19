@@ -179,14 +179,14 @@
 **Description:** Builder `golang:1.27.1-bookworm` with CGo prerequisites (build-essential, make, pkg-config, wget, and MuPDF build deps: libjpeg-dev, libfreetype6-dev, libharfbuzz-dev, zlib1g-dev, libssl-dev), `CGO_ENABLED=1 go build -o /app/microservicio-go ./cmd/api`. Runner `debian:bookworm-slim` with CA certs and a non-root user, copying only the binary. `.dockerignore` excludes `.git`, `bin/`, logs, `.env`. Smoke: container starts and `/health` responds.
 
 **Acceptance criteria:**
-- [ ] `docker build .` produces a working image (no Alpine — musl conflicts with MuPDF)
-- [ ] Runs as non-root; only essential runtime packages present
-- [ ] Container starts and `GET /health` responds (gated on a reachable Mongo for `200`, but `503` with problem body still proves HTTP up)
-- [ ] No `.env`/secrets baked into any layer (`docker history` spot-check)
+- [x] `docker build .` produces a working image (no Alpine — musl conflicts with MuPDF)
+- [x] Runs as non-root; only essential runtime packages present
+- [x] Container starts and `GET /health` responds (gated on a reachable Mongo for `200`, but `503` with problem body still proves HTTP up)
+- [x] No `.env`/secrets baked into any layer (`docker history` spot-check)
 
 **Verification:**
-- [ ] `docker build -t microservicio-go . && docker run -p 8080:8080 microservicio-go` → `curl localhost:8080/api/v1/health`
-- [ ] Spot-check layers: `docker history --no-trunc microservicio-go | Select-String -Pattern 'env|KEY|secret'` empty
+- [x] `docker build -t microservicio-go . && docker run -p 8080:8080 microservicio-go` → `curl localhost:8080/api/v1/health`
+- [x] Spot-check layers: `docker history --no-trunc microservicio-go | Select-String -Pattern 'env|KEY|secret'` empty
 
 **Dependencies:** Tasks 3, 6
 
@@ -200,7 +200,7 @@
 
 ## Checkpoint: Complete
 
-- [ ] All [`SPEC.md` Success Criteria](../SPEC.md) satisfied
-- [ ] `go build ./...`, `go test -race ./...`, `go vet ./...`, `golangci-lint run ./...` green on CI
-- [ ] Docker image builds, runs non-root, health responds
+- [x] All [`SPEC.md` Success Criteria](../SPEC.md) satisfied
+- [x] `go build ./...`, `go test -race ./...`, `go vet ./...`, `golangci-lint run ./...` green on CI
+- [x] Docker image builds, runs non-root, health responds
 - [ ] Final human review + commit
