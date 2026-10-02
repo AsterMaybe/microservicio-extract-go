@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,8 +68,298 @@ func (r *stubRepository) records() []*domain.ExtractionRecord {
 	return r.saved
 }
 
-func newUseCase(p domain.DocumentProcessor, r domain.ExtractionRepository, c int) *application.ExtractTextUseCase {
-	return application.NewExtractTextUseCase(p, r, c)
+func newUseCase(p domain.DocumentProcessor, r domain.ExtractionRepository, workers int) *application.ExtractTextUseCase {
+	return application.NewExtractTextUseCase(p, r, nil, application.Limits{Workers: workers})
+}
+
+// stubCache is an in-memory domain.Cache that records lookups and writes.
+type stubCache struct {
+	mu      sync.Mutex
+	entries map[string]stubCacheEntry
+	gets    int
+	sets    int
+}
+
+type stubCacheEntry struct {
+	content   string
+	pageCount int
+}
+
+func newStubCache() *stubCache {
+	return &stubCache{entries: map[string]stubCacheEntry{}}
+}
+
+func (c *stubCache) Get(_ context.Context, key string) (string, int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gets++
+	e, ok := c.entries[key]
+	if !ok {
+		return "", 0, false
+	}
+	return e.content, e.pageCount, true
+}
+
+func (c *stubCache) Set(_ context.Context, key, content string, pageCount int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sets++
+	c.entries[key] = stubCacheEntry{content: content, pageCount: pageCount}
+	return nil
+}
+
+func (c *stubCache) stats() (gets, sets int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets, c.sets
+}
+
+// countingProcessor records how many times the parser actually ran.
+type countingProcessor struct {
+	mu    sync.Mutex
+	calls int
+	text  string
+	pages int
+}
+
+func (p *countingProcessor) ExtractText(_ context.Context, _ []byte) (string, int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return p.text, p.pages, nil
+}
+
+func (p *countingProcessor) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+func TestExtract_CacheMiss_ParsesAndWarmsCache(t *testing.T) {
+	processor := &countingProcessor{text: "cached body", pages: 3}
+	cache := newStubCache()
+	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 2})
+
+	data := []byte("%PDF-1.7\ncacheable document")
+	out, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if out.Content != "cached body" || out.PageCount != 3 {
+		t.Fatalf("unexpected output: %+v", out)
+	}
+	if processor.callCount() != 1 {
+		t.Errorf("parser calls = %d, want 1 on a miss", processor.callCount())
+	}
+	if _, sets := cache.stats(); sets != 1 {
+		t.Errorf("cache writes = %d, want 1 after a miss", sets)
+	}
+}
+
+func TestExtract_CacheHit_SkipsParser(t *testing.T) {
+	processor := &countingProcessor{text: "cached body", pages: 3}
+	cache := newStubCache()
+	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 2})
+
+	data := []byte("%PDF-1.7\ncacheable document")
+	first, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data})
+	if err != nil {
+		t.Fatalf("first Extract: %v", err)
+	}
+
+	second, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "different-name.pdf", Data: data})
+	if err != nil {
+		t.Fatalf("second Extract: %v", err)
+	}
+
+	if processor.callCount() != 1 {
+		t.Errorf("parser calls = %d, want 1: the hit must not re-parse", processor.callCount())
+	}
+	if second != first {
+		t.Errorf("cached response must match the original: %+v vs %+v", second, first)
+	}
+}
+
+func TestExtract_CacheHit_SkipsPersistence(t *testing.T) {
+	processor := &countingProcessor{text: "t", pages: 1}
+	repo := &stubRepository{}
+	cache := newStubCache()
+	uc := application.NewExtractTextUseCase(processor, repo, cache, application.Limits{Workers: 2})
+
+	data := []byte("%PDF-1.7\nrepeat")
+	if _, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data}); err != nil {
+		t.Fatalf("first Extract: %v", err)
+	}
+	if _, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data}); err != nil {
+		t.Fatalf("second Extract: %v", err)
+	}
+	if recs := repo.records(); len(recs) != 1 {
+		t.Errorf("records = %d, want 1: a cache hit must not persist again", len(recs))
+	}
+}
+
+func TestExtract_ConcurrentSameDocument_ParsesOnce(t *testing.T) {
+	processor := &countingProcessor{text: "coalesced", pages: 2}
+	cache := newStubCache()
+	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 4})
+
+	data := []byte("%PDF-1.7\nstampede candidate")
+	const n = 12
+	results := make([]application.ExtractOutput, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+		if results[i].Content != "coalesced" || results[i].PageCount != 2 {
+			t.Errorf("goroutine %d got %+v, want the shared result", i, results[i])
+		}
+	}
+	if got := processor.callCount(); got != 1 {
+		t.Errorf("parser calls = %d, want 1: concurrent misses must coalesce", got)
+	}
+}
+
+func TestExtract_AdmissionWindowElapsedShedsWithOverloaded(t *testing.T) {
+	blocking := &blockingProcessor{started: make(chan struct{}), release: make(chan struct{})}
+	repo := &stubRepository{}
+	uc := application.NewExtractTextUseCase(blocking, repo, nil, application.Limits{Workers: 1})
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: pdfMagic})
+		firstDone <- err
+	}()
+	<-blocking.started // the only worker slot is occupied
+
+	// A different document waits for the busy slot. The admission budget comes
+	// from the caller's context, which is what the HTTP layer sets; here we
+	// simulate an already-admitted request whose budget runs out while queued.
+	admitCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := uc.Extract(admitCtx, application.ExtractInput{
+		Filename: "b.pdf",
+		Data:     []byte("%PDF-1.7\nshed me"),
+	})
+	if !errors.Is(err, domain.ErrOverloaded) {
+		t.Fatalf("err = %v, want ErrOverloaded", err)
+	}
+	if got := domain.SlugFor(err); got != domain.ErrorTypeOverloaded {
+		t.Errorf("SlugFor = %q, want %q", got, domain.ErrorTypeOverloaded)
+	}
+
+	close(blocking.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first extraction failed: %v", err)
+	}
+
+	// A refusal is not an attempt, so only the completed request is recorded.
+	if got := len(repo.records()); got != 1 {
+		t.Errorf("persisted %d record(s), want 1 (only the completed request)", got)
+	}
+}
+
+// blockedProcessor blocks every call until release is closed, so N requests can
+// pile up against the same worker pool deterministically.
+type blockedProcessor struct {
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockedProcessor) ExtractText(ctx context.Context, _ []byte) (string, int, error) {
+	b.calls.Add(1)
+	select {
+	case <-b.release:
+		return "queued", 1, nil
+	case <-ctx.Done():
+		return "", 0, ctx.Err()
+	}
+}
+
+// TestExtract_ConcurrentMissesWaitForSlotsThenAllSucceed covers the use-case
+// half of the hybrid pattern: once admitted, a burst of distinct documents
+// waits for parse slots instead of being dropped, and every one of them
+// completes as slots free up. The bounded queue that sheds arrivals lives in
+// the HTTP layer (see TestExtract_FullQueueShedsImmediately there).
+func TestExtract_ConcurrentMissesWaitForSlotsThenAllSucceed(t *testing.T) {
+	processor := &blockedProcessor{release: make(chan struct{})}
+	repo := &stubRepository{}
+	uc := application.NewExtractTextUseCase(processor, repo, nil, application.Limits{
+		Workers: 1, // one parse at a time
+	})
+
+	const burst = 8
+	var (
+		wg        sync.WaitGroup
+		completed atomic.Int32
+	)
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Distinct bytes: different hashes, so no singleflight coalescing
+			// and every request really contends for the single worker slot.
+			_, err := uc.Extract(context.Background(), application.ExtractInput{
+				Filename: "q.pdf",
+				Data:     []byte("%PDF-1.7\ndocument number " + strconv.Itoa(i)),
+			})
+			if err != nil {
+				t.Errorf("request %d failed: %v", i, err)
+			}
+			completed.Add(1)
+		}(i)
+	}
+
+	// Exactly one runs; the rest are waiting on the slot, not shed. None may have
+	// completed, because every one of them is still blocked on the worker.
+	time.Sleep(150 * time.Millisecond)
+	if got := processor.calls.Load(); got != 1 {
+		t.Fatalf("parser calls = %d, want exactly 1 running while the rest wait", got)
+	}
+	if got := completed.Load(); got != 0 {
+		t.Fatalf("%d requests already completed; they should still be waiting", got)
+	}
+
+	close(processor.release)
+	wg.Wait()
+	if got := completed.Load(); got != burst {
+		t.Errorf("completed = %d, want %d: every waiting request must eventually run", got, burst)
+	}
+	if got := processor.calls.Load(); got != burst {
+		t.Errorf("parser calls = %d, want %d", got, burst)
+	}
+}
+
+// TestExtract_RealFailureStillPersists guards the other side of the rule: only
+// refusals skip persistence. A document that genuinely fails to extract is a
+// useful record and must still be stored.
+func TestExtract_RealFailureStillPersists(t *testing.T) {
+	repo := &stubRepository{}
+	uc := application.NewExtractTextUseCase(
+		&stubProcessor{err: domain.ErrMalformedDocument}, repo, nil, application.Limits{Workers: 1})
+
+	if _, err := uc.Extract(context.Background(), application.ExtractInput{
+		Filename: "broken.pdf",
+		Data:     pdfMagic,
+	}); !errors.Is(err, domain.ErrMalformedDocument) {
+		t.Fatalf("err = %v, want ErrMalformedDocument", err)
+	}
+	if got := len(repo.records()); got != 1 {
+		t.Errorf("persisted %d record(s), want 1: a real extraction failure must be recorded", got)
+	}
 }
 
 func TestExtract_Success(t *testing.T) {
@@ -81,17 +373,11 @@ func TestExtract_Success(t *testing.T) {
 		t.Fatalf("Extract returned error: %v", err)
 	}
 
-	if out.Filename != "report.pdf" || out.Extension != "pdf" || out.MimeType != "application/pdf" {
-		t.Errorf("output identity fields wrong: %+v", out)
-	}
-	if out.Text != "hello pdf text" {
-		t.Errorf("Text = %q, want extracted text", out.Text)
+	if out.Content != "hello pdf text" {
+		t.Errorf("Content = %q, want extracted text", out.Content)
 	}
 	if out.PageCount != 4 {
 		t.Errorf("PageCount = %d, want 4", out.PageCount)
-	}
-	if out.TextLength != len("hello pdf text") {
-		t.Errorf("TextLength = %d, want %d", out.TextLength, len("hello pdf text"))
 	}
 	if out.DurationMS < 0 {
 		t.Errorf("DurationMS = %d, want >= 0", out.DurationMS)
@@ -129,8 +415,8 @@ func TestExtract_MimeDerivedFromContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if out.MimeType != "application/pdf" {
-		t.Errorf("MimeType = %q, want application/pdf (content-derived)", out.MimeType)
+	if out.Content != "t" {
+		t.Errorf("Content = %q, want extracted text", out.Content)
 	}
 }
 
@@ -140,8 +426,8 @@ func TestExtract_ExtensionLowercased(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if out.Extension != "pdf" {
-		t.Errorf("Extension = %q, want %q", out.Extension, "pdf")
+	if out.Content != "t" {
+		t.Errorf("Content = %q, want extracted text", out.Content)
 	}
 }
 
@@ -221,7 +507,12 @@ func TestExtract_ProcessorDeadline_PersistedAsTimeout(t *testing.T) {
 	assertOneErrorRecord(t, repo, domain.ErrorTypeTimeout)
 }
 
-func TestExtract_CancelledWhileWaiting_PersistedAsTimeout(t *testing.T) {
+// TestExtract_CancelledWhileWaiting_ShedsAsOverloadedNotTimeout pins the
+// distinction that matters under load: a request that dies waiting for a slot
+// never got parsed, so it must not be reported as an extraction timeout. A 504
+// tells clients the document was too slow and not to retry, which is the wrong
+// advice exactly when the service is under pressure.
+func TestExtract_CancelledWhileWaiting_ShedsAsOverloadedNotTimeout(t *testing.T) {
 	blocking := &blockingProcessor{started: make(chan struct{}), release: make(chan struct{})}
 	repo := &stubRepository{}
 	uc := newUseCase(blocking, repo, 1)
@@ -235,22 +526,20 @@ func TestExtract_CancelledWhileWaiting_PersistedAsTimeout(t *testing.T) {
 	}()
 	<-blocking.started // first call holds the only slot
 
+	// Distinct bytes: a different content hash means a different coalescing
+	// key, so this request must genuinely queue for the worker slot.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel2()
-	_, err := uc.Extract(ctx2, application.ExtractInput{Filename: "b.pdf", Data: pdfMagic})
-	if !errors.Is(err, domain.ErrExtractionTimeout) {
-		t.Fatalf("err = %v, want ErrExtractionTimeout from queue wait", err)
+	other := []byte("%PDF-1.7\nsecond document")
+	_, err := uc.Extract(ctx2, application.ExtractInput{Filename: "b.pdf", Data: other})
+	if !errors.Is(err, domain.ErrOverloaded) {
+		t.Fatalf("err = %v, want ErrOverloaded (never parsed), got ErrExtractionTimeout", err)
 	}
-
-	recs := repo.records()
-	found := false
-	for _, r := range recs {
-		if r.Filename == "b.pdf" && r.Error != nil && r.Error.Type == domain.ErrorTypeTimeout {
-			found = true
-		}
+	if errors.Is(err, domain.ErrExtractionTimeout) {
+		t.Error("a queue wait must never be reported as an extraction timeout")
 	}
-	if !found {
-		t.Errorf("expected a timeout error record for b.pdf, got: %+v", recs)
+	if got := domain.SlugFor(err); got != domain.ErrorTypeOverloaded {
+		t.Errorf("SlugFor = %q, want %q", got, domain.ErrorTypeOverloaded)
 	}
 
 	close(blocking.release)

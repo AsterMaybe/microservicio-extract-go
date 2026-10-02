@@ -11,12 +11,8 @@ type ExtractInput struct {
 
 // ExtractOutput is the successful extraction result returned to the caller.
 type ExtractOutput struct {
-	Filename   string
-	Extension  string
-	MimeType   string
-	Text       string
+	Content    string
 	PageCount  int
-	TextLength int
 	DurationMS int64
 }
 
