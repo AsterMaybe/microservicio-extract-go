@@ -14,9 +14,6 @@ import (
 const (
 	problemTypeTooLarge           = "too-large"
 	problemTypeServiceUnavailable = "service-unavailable"
-	// problemTypeBusy is returned when the in-flight upload admission limit is
-	// exhausted: the service fails fast before buffering more uploads in RAM.
-	problemTypeBusy = "busy"
 )
 
 type problemDefinition struct {
@@ -43,6 +40,11 @@ var problemRegistry = map[string]problemDefinition{
 		title:  "Extraction timed out",
 		detail: "Text extraction took longer than the configured timeout and was aborted.",
 	},
+	domain.ErrorTypeOverloaded: {
+		status: http.StatusTooManyRequests,
+		title:  "Too Many Requests",
+		detail: "The service could not accept the request within its admission window; retry shortly.",
+	},
 	domain.ErrorTypeInternal: {
 		status: http.StatusInternalServerError,
 		title:  "Internal Server Error",
@@ -57,11 +59,6 @@ var problemRegistry = map[string]problemDefinition{
 		status: http.StatusServiceUnavailable,
 		title:  "Service Unavailable",
 		detail: "A required dependency (e.g. the database) is currently unreachable.",
-	},
-	problemTypeBusy: {
-		status: http.StatusServiceUnavailable,
-		title:  "Service Busy",
-		detail: "The service is at capacity; retry the request later.",
 	},
 }
 
@@ -89,6 +86,10 @@ func writeProblemSlug(c *gin.Context, baseURL, slug, title, detail string, statu
 }
 
 func writeProblemDoc(c *gin.Context, baseURL, slug, title, detail string, status int, instance string) {
+	requestID := c.GetString("request_id")
+	if requestID != "" {
+		instance = instance + "?request_id=" + requestID
+	}
 	c.Header("Content-Type", "application/problem+json")
 	c.JSON(status, problem{
 		Type:     strings.TrimRight(baseURL, "/") + "/" + slug,
