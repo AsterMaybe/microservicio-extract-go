@@ -9,6 +9,9 @@ var (
 	ErrEmptyInput        = errors.New("empty input")
 	ErrMalformedDocument = errors.New("malformed document")
 	ErrExtractionTimeout = errors.New("extraction timeout")
+	// ErrOverloaded signals that the work queue could not admit the request
+	// within the admission window, so it was shed instead of queued further.
+	ErrOverloaded = errors.New("service overloaded")
 )
 
 // Stable problem-type slugs, shared between persisted records and the
@@ -17,6 +20,7 @@ const (
 	ErrorTypeInvalidFile  = "invalid-file"
 	ErrorTypeMalformedPDF = "malformed-pdf"
 	ErrorTypeTimeout      = "timeout"
+	ErrorTypeOverloaded   = "overloaded"
 	ErrorTypeInternal     = "server-error"
 )
 
@@ -36,6 +40,8 @@ func SlugFor(err error) string {
 		return ErrorTypeInvalidFile
 	case errors.Is(err, ErrMalformedDocument):
 		return ErrorTypeMalformedPDF
+	case errors.Is(err, ErrOverloaded):
+		return ErrorTypeOverloaded
 	case errors.Is(err, ErrExtractionTimeout):
 		return ErrorTypeTimeout
 	default:

@@ -13,8 +13,10 @@ import (
 
 	"microservicio-go/application"
 	"microservicio-go/config"
+	"microservicio-go/domain"
 	fitzadapter "microservicio-go/infrastructure/fitz"
 	mongorepo "microservicio-go/infrastructure/mongo"
+	redisadapter "microservicio-go/infrastructure/redis"
 	"microservicio-go/presentation"
 )
 
@@ -39,13 +41,28 @@ func run() error {
 		return fmt.Errorf("init mongo: %w", err)
 	}
 
-	useCase := application.NewExtractTextUseCase(fitzadapter.NewAdapter(), repo, cfg.Concurrency)
+	cache, err := redisadapter.NewAdapter(cfg.RedisURL, cfg.CacheTTL)
+	if err != nil {
+		_ = repo.Disconnect(context.Background())
+		return fmt.Errorf("init redis: %w", err)
+	}
 
-	router := presentation.NewRouter(useCase, repo, presentation.Config{
+	useCase := application.NewExtractTextUseCase(fitzadapter.NewAdapter(), repo, cache, application.Limits{
+		Workers:      cfg.Concurrency,
+		Admission:    cfg.AdmissionTimeout,
+		CacheTimeout: cfg.CacheTimeout,
+	})
+
+	// Health must cover every dependency the extract path needs: a degraded
+	// Redis or Mongo means cache misses and failed persistence, so report the
+	// instance unhealthy instead of silently serving degraded extractions.
+	router := presentation.NewRouter(useCase, healthChecker{mongo: repo, redis: cache}, presentation.Config{
 		ErrBaseURL:        cfg.ErrBaseURL,
 		MaxUploadBytes:    cfg.MaxUploadBytes,
 		ExtractionTimeout: cfg.ExtractionTimeout,
 		MaxInFlight:       cfg.MaxInFlight,
+		QueueSize:         cfg.QueueSize,
+		AdmissionTimeout:  cfg.AdmissionTimeout,
 	})
 
 	srv := &http.Server{
@@ -65,6 +82,7 @@ func run() error {
 	select {
 	case err := <-errCh:
 		_ = repo.Disconnect(context.Background())
+		_ = cache.Close()
 		return fmt.Errorf("server: %w", err)
 	case <-ctx.Done():
 		log.Printf("shutdown signal received")
@@ -72,12 +90,32 @@ func run() error {
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			_ = repo.Disconnect(context.Background())
+			_ = cache.Close()
 			return fmt.Errorf("graceful shutdown: %w", err)
 		}
 		if err := repo.Disconnect(context.Background()); err != nil {
+			_ = cache.Close()
 			return fmt.Errorf("disconnect mongo: %w", err)
 		}
+		_ = cache.Close()
 		log.Printf("shutdown complete")
 		return nil
 	}
+}
+
+// healthChecker aggregates dependency probes into the single HealthChecker seam the
+// router depends on. Every probe must pass for the instance to report healthy.
+type healthChecker struct {
+	mongo domain.HealthChecker
+	redis domain.HealthChecker
+}
+
+func (h healthChecker) Ping(ctx context.Context) error {
+	if err := h.mongo.Ping(ctx); err != nil {
+		return fmt.Errorf("mongo: %w", err)
+	}
+	if err := h.redis.Ping(ctx); err != nil {
+		return fmt.Errorf("redis: %w", err)
+	}
+	return nil
 }

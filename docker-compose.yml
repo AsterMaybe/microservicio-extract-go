@@ -23,8 +23,28 @@ services:
       - GIN_MODE=${GIN_MODE:-release}
       # Tamaño máximo de PDF en MB (default 25).
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-25}
-      # Admission control: subidas simultáneas en RAM antes de la extracción.
+      # Redis: caché de extracciones por SHA-256 del binario. Un hit devuelve
+      # 200 sin volver a parsear. Corre en la red compartida de pdfextract.
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      # CACHÉ: vida de cada entrada.
+      - CACHE_TTL=${CACHE_TTL:-24h}
+      # Límite de una ida y vuelta a Redis: una caché colgada cueste un timeout,
+      # no una petición colgada.
+      - REDIS_TIMEOUT=${REDIS_TIMEOUT:-2s}
+      # Backpressure híbrido: cola acotada + timeout de admisión.
+      #   CONCURRENCY        extracciones simultáneas (0 = una por core de CPU)
+      #   QUEUE_SIZE         cola de espera, tomada ANTES de leer el body: un
+      #                      request encolado no sujeta bytes del PDF. Llena ->
+      #                      429 inmediato, sin esperar.
+      #   MAX_IN_FLIGHT      cuerpos en RAM a la vez; aquí se espera turno, y el
+      #                      ADMISSION_TIMEOUT acota esa espera -> 429
+      #   ADMISSION_TIMEOUT  presupuesto de espera (< EXTRACTION_TIMEOUT)
+      #   EXTRACTION_TIMEOUT presupuesto del parseo en sí -> 504
+      - CONCURRENCY=${CONCURRENCY:-0}
+      - QUEUE_SIZE=${QUEUE_SIZE:-200}
       - MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-32}
+      - ADMISSION_TIMEOUT=${ADMISSION_TIMEOUT:-2s}
+      - EXTRACTION_TIMEOUT=${EXTRACTION_TIMEOUT:-30s}
     labels:
       - "traefik.enable=true"
       # Red que Traefik debe usar para alcanzar este contenedor (la interpola compose).
@@ -41,8 +61,8 @@ services:
       # destino del error son por-servicio.
       - "traefik.http.routers.go-extract.middlewares=go-errors,go-ratelimit,go-cb"
       # Rate limit (bucket propio, no compartido con el monolito).
-      - "traefik.http.middlewares.go-ratelimit.ratelimit.average=300"
-      - "traefik.http.middlewares.go-ratelimit.ratelimit.burst=100"
+      - "traefik.http.middlewares.go-ratelimit.ratelimit.average=500"
+      - "traefik.http.middlewares.go-ratelimit.ratelimit.burst=1000"
       # Circuit breaker propio.
       - "traefik.http.middlewares.go-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.33"
       # Errors (RFC 9457): delega 429/503 a este mismo servicio para que
@@ -66,6 +86,15 @@ services:
       start_period: 10s
     networks:
       - shared-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+      replicas: 5
 
 networks:
   shared-network:

@@ -55,12 +55,9 @@ func (b *blockingExtractor) Extract(ctx context.Context, _ application.ExtractIn
 	select {
 	case <-b.release:
 		return application.ExtractOutput{
-			Filename:   "a.pdf",
-			Extension:  "pdf",
-			MimeType:   "application/pdf",
-			Text:       "ok",
+			Content:    "ok",
 			PageCount:  1,
-			TextLength: 2,
+			DurationMS: 2,
 		}, nil
 	case <-ctx.Done():
 		return application.ExtractOutput{}, ctx.Err()
@@ -75,7 +72,7 @@ func testConfig() presentation.Config {
 	}
 }
 
-func newTestRouter(t *testing.T, ex presentation.Extractor, p presentation.Pinger, cfg presentation.Config) *gin.Engine {
+func newTestRouter(t *testing.T, ex application.Extractor, p presentation.Pinger, cfg presentation.Config) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	return presentation.NewRouter(ex, p, cfg)
@@ -127,19 +124,22 @@ func decodeProblem(t *testing.T, rec *httptest.ResponseRecorder) map[string]any 
 	return m
 }
 
+func assertInstance(t *testing.T, instance, wantPath string) {
+	t.Helper()
+	if !strings.HasPrefix(instance, wantPath+"?request_id=") && instance != wantPath {
+		t.Errorf("instance = %q, want prefix %q?request_id=... or exact %q", instance, wantPath, wantPath)
+	}
+}
+
 func TestExtract_ValidUpload_ReturnsEnvelope(t *testing.T) {
 	ex := &stubExtractor{out: application.ExtractOutput{
-		Filename:   "invoice.pdf",
-		Extension:  "pdf",
-		MimeType:   "application/pdf",
-		Text:       "hello from the pdf",
+		Content:    "hello from the pdf",
 		PageCount:  1,
-		TextLength: 18,
 		DurationMS: 3,
 	}}
 	router := newTestRouter(t, ex, &stubPinger{}, testConfig())
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "invoice.pdf", []byte("%PDF-1.7\n...")))
+	rec := perform(t, router, uploadRequest(t, "/extract", "invoice.pdf", []byte("%PDF-1.7\n...")))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
@@ -148,13 +148,16 @@ func TestExtract_ValidUpload_ReturnsEnvelope(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	want := map[string]any{"filename": "invoice.pdf", "extension": "pdf", "mime_type": "application/pdf", "text": "hello from the pdf"}
+	want := map[string]any{"content": "hello from the pdf"}
 	for k, v := range want {
 		if m[k] != v {
 			t.Errorf("envelope[%q] = %v, want %v", k, m[k], v)
 		}
 	}
-	for _, k := range []string{"filename", "extension", "mime_type", "text"} {
+	if m["page_count"] != float64(1) {
+		t.Errorf("envelope[page_count] = %v, want 1", m["page_count"])
+	}
+	for _, k := range []string{"content", "page_count"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("envelope missing key %q: %v", k, m)
 		}
@@ -166,7 +169,7 @@ func TestExtract_FileTooLarge_Returns413Problem(t *testing.T) {
 	cfg.MaxUploadBytes = 32
 	router := newTestRouter(t, &stubExtractor{}, &stubPinger{}, cfg)
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "big.pdf", bytes.Repeat([]byte("x"), 128)))
+	rec := perform(t, router, uploadRequest(t, "/extract", "big.pdf", bytes.Repeat([]byte("x"), 128)))
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413 (%s)", rec.Code, rec.Body.String())
@@ -178,33 +181,41 @@ func TestExtract_FileTooLarge_Returns413Problem(t *testing.T) {
 	if m["status"].(float64) != 413 {
 		t.Errorf("status field = %v, want 413", m["status"])
 	}
-	if m["instance"] != "/api/v1/extract" {
-		t.Errorf("instance = %v, want path /api/v1/extract", m["instance"])
-	}
+	assertInstance(t, m["instance"].(string), "/extract")
 }
 
-func TestExtract_Saturated_Returns503Problem(t *testing.T) {
+// TestExtract_Saturated_ShedsWith429AfterAdmissionWindow covers the RAM guard.
+// MAX_IN_FLIGHT no longer fails fast: an already-admitted request waits for a
+// buffer rather than being dropped, so saturation surfaces once the admission
+// window elapses, as a retryable 429 instead of a 503. Failing fast here would
+// discard admissions the queue has already paid for.
+func TestExtract_Saturated_ShedsWith429AfterAdmissionWindow(t *testing.T) {
 	ex := &blockingExtractor{entered: make(chan struct{}), release: make(chan struct{})}
+
 	cfg := testConfig()
 	cfg.MaxInFlight = 1
+	cfg.QueueSize = 10
+	cfg.AdmissionTimeout = 150 * time.Millisecond
 	router := newTestRouter(t, ex, &stubPinger{}, cfg)
 
-	firstReq := uploadRequest(t, "/api/v1/extract", "a.pdf", []byte("%PDF-1.7\n"))
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, firstReq)
+		router.ServeHTTP(rec, uploadRequest(t, "/extract", "a.pdf", []byte("%PDF-1.7\n")))
 		firstDone <- rec
 	}()
-	<-ex.entered // the first request is buffering and holds the only slot
+	<-ex.entered // the first request is buffering and holds the only RAM slot
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "b.pdf", []byte("%PDF-1.7\n")))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	start := time.Now()
+	rec := perform(t, router, uploadRequest(t, "/extract", "b.pdf", []byte("%PDF-1.7\n")))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 once the admission window elapses (%s)", rec.Code, rec.Body.String())
 	}
-	m := decodeProblem(t, rec)
-	if !strings.HasSuffix(m["type"].(string), "/busy") {
-		t.Errorf("type = %v, want to end in /busy", m["type"])
+	if got := time.Since(start); got > 2*time.Second {
+		t.Errorf("shed took %s; the admission window is 150ms", got)
+	}
+	if m := decodeProblem(t, rec); !strings.HasSuffix(m["type"].(string), "/"+domain.ErrorTypeOverloaded) {
+		t.Errorf("type = %v, want to end in /overloaded", m["type"])
 	}
 
 	close(ex.release)
@@ -213,7 +224,7 @@ func TestExtract_Saturated_Returns503Problem(t *testing.T) {
 	}
 
 	// Slot freed: a fresh request is admitted again.
-	rec2 := perform(t, router, uploadRequest(t, "/api/v1/extract", "c.pdf", []byte("%PDF-1.7\n")))
+	rec2 := perform(t, router, uploadRequest(t, "/extract", "c.pdf", []byte("%PDF-1.7\n")))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("status after release = %d, want 200 (%s)", rec2.Code, rec2.Body.String())
 	}
@@ -226,7 +237,7 @@ func TestExtract_MissingFileField_Returns400Problem(t *testing.T) {
 	mw := multipart.NewWriter(&body)
 	_ = mw.WriteField("note", "no file here")
 	_ = mw.Close()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/extract", &body)
+	req := httptest.NewRequest(http.MethodPost, "/extract", &body)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
 	rec := perform(t, router, req)
@@ -243,7 +254,7 @@ func TestExtract_MissingFileField_Returns400Problem(t *testing.T) {
 func TestExtract_MalformedPDF_Returns422Problem(t *testing.T) {
 	router := newTestRouter(t, &stubExtractor{err: domain.ErrMalformedDocument}, &stubPinger{}, testConfig())
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "broken.pdf", []byte("%PDF-1.7\nnonsense")))
+	rec := perform(t, router, uploadRequest(t, "/extract", "broken.pdf", []byte("%PDF-1.7\nnonsense")))
 
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 (%s)", rec.Code, rec.Body.String())
@@ -257,7 +268,7 @@ func TestExtract_MalformedPDF_Returns422Problem(t *testing.T) {
 func TestExtract_Timeout_Returns504Problem(t *testing.T) {
 	router := newTestRouter(t, &stubExtractor{err: context.DeadlineExceeded}, &stubPinger{}, testConfig())
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "slow.pdf", []byte("%PDF-1.7\n")))
+	rec := perform(t, router, uploadRequest(t, "/extract", "slow.pdf", []byte("%PDF-1.7\n")))
 
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504 (%s)", rec.Code, rec.Body.String())
@@ -272,7 +283,7 @@ func TestExtract_InternalError_DoesNotLeakInternals(t *testing.T) {
 	secret := "secret db password for production"
 	router := newTestRouter(t, &stubExtractor{err: errors.New(secret)}, &stubPinger{}, testConfig())
 
-	rec := perform(t, router, uploadRequest(t, "/api/v1/extract", "x.pdf", []byte("%PDF-1.7\n")))
+	rec := perform(t, router, uploadRequest(t, "/extract", "x.pdf", []byte("%PDF-1.7\n")))
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (%s)", rec.Code, rec.Body.String())
@@ -289,6 +300,26 @@ func TestExtract_InternalError_DoesNotLeakInternals(t *testing.T) {
 		if strings.Contains(body, frag) {
 			t.Errorf("response leaks internal fragment %q: %s", frag, body)
 		}
+	}
+}
+
+func TestExtract_Overloaded_Returns429WithRetryAfter(t *testing.T) {
+	router := newTestRouter(t, &stubExtractor{err: domain.ErrOverloaded}, &stubPinger{}, testConfig())
+
+	rec := perform(t, router, uploadRequest(t, "/extract", "hot.pdf", []byte("%PDF-1.7\n")))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (%s)", rec.Code, rec.Body.String())
+	}
+	m := decodeProblem(t, rec)
+	if !strings.HasSuffix(m["type"].(string), "/overloaded") {
+		t.Errorf("type = %v, want to end in /overloaded", m["type"])
+	}
+	if m["status"].(float64) != 429 {
+		t.Errorf("status field = %v, want 429", m["status"])
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("shed requests must carry a Retry-After header")
 	}
 }
 

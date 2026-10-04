@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func expectProblem(t *testing.T, rr *httptest.ResponseRecorder, wantStatus int, wantType, wantTitle, wantDetail, wantInstance string) {
+func expectProblem(t *testing.T, rr *httptest.ResponseRecorder, wantStatus int, wantType, wantTitle, wantDetail, wantInstancePrefix string) {
 	t.Helper()
 	if rr.Code != wantStatus {
 		t.Fatalf("status = %d, want %d (body %s)", rr.Code, wantStatus, rr.Body.String())
@@ -23,7 +23,11 @@ func expectProblem(t *testing.T, rr *httptest.ResponseRecorder, wantStatus int, 
 	assertField(t, body, "type", wantType)
 	assertField(t, body, "title", wantTitle)
 	assertField(t, body, "detail", wantDetail)
-	assertField(t, body, "instance", wantInstance)
+	// Instance now includes ?request_id=... suffix for tracing
+	instance, _ := body["instance"].(string)
+	if !strings.HasPrefix(instance, wantInstancePrefix+"?request_id=") && instance != wantInstancePrefix {
+		t.Errorf("instance = %q, want prefix %q?request_id=... or exact %q", instance, wantInstancePrefix, wantInstancePrefix)
+	}
 	if status, ok := body["status"].(float64); !ok || int(status) != wantStatus {
 		t.Errorf("status field = %v, want %d", body["status"], wantStatus)
 	}

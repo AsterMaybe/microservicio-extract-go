@@ -35,6 +35,11 @@ func (a *Adapter) ExtractText(ctx context.Context, data []byte) (string, int, er
 
 	pages := doc.NumPage()
 	var sb strings.Builder
+
+	// Efficiency: Pre-allocating based on page count reduces GC pressure by skipping
+	// the first ~10-15 dynamic reallocation cycles that strings.Builder would
+	// otherwise perform when growing incrementally during large extractions.
+	sb.Grow(pages * 1024)
 	for n := 0; n < pages; n++ {
 		if err := ctx.Err(); err != nil {
 			return sb.String(), pages, fmt.Errorf("extract page %d: %w", n, err)
