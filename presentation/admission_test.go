@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +24,8 @@ func (h *holdProcessor) ExtractText(context.Context, []byte) (string, int, error
 	return "text", 1, nil
 }
 
-// hangProcessor blocks but still honours cancellation.
+// hangProcessor blocks but still honours cancellation, so it models a parse
+// that is genuinely in flight and gets cut short by its own deadline.
 type hangProcessor struct{ release chan struct{} }
 
 func (h *hangProcessor) ExtractText(ctx context.Context, _ []byte) (string, int, error) {
@@ -198,5 +200,42 @@ func TestExtract_QueuedBurstAbsorbsBeyondMaxInFlight(t *testing.T) {
 		t.Errorf("all %d requests were shed (%d of them); a queue of %d with 2 read slots should absorb part of the burst",
 			burst, shed, cfg.QueueSize)
 	}
-	t.Logf("burst of %d: absorbed=%d shed429=%d", burst, absorbed, shed)
+t.Logf("burst of %d: absorbed=%d shed429=%d", burst, absorbed, shed)
+}
+
+// TestExtract_ParseDeadlineExpired_Returns504 is the other half of the
+// 429/504 distinction that TestExtract_AdmissionTimeoutShedsWith429 pins from
+// the queue side. Once a request owns a slot and is actually parsing,
+// exceeding EXTRACTION_TIMEOUT is a slow document, not queueing latency, so it
+// must be reported as 504 and never as 429.
+//
+// The admission budget here is deliberately generous: it must not be what
+// fires, otherwise the test would pass for the wrong reason.
+func TestExtract_ParseDeadlineExpired_Returns504(t *testing.T) {
+	const extraction = 100 * time.Millisecond
+
+	proc := &hangProcessor{release: make(chan struct{})}
+	defer close(proc.release)
+
+	uc := application.NewExtractTextUseCase(proc, noopRepo{}, nil, application.Limits{
+		Workers:   1,
+		Admission: 2 * time.Second, // must NOT be what fires
+	})
+
+	cfg := testConfig()
+	cfg.QueueSize = 50
+	cfg.MaxInFlight = 32
+	cfg.AdmissionTimeout = 2 * time.Second // must NOT be what fires
+	cfg.ExtractionTimeout = extraction
+	router := newTestRouter(t, uc, &stubPinger{}, cfg)
+
+	rec := perform(t, router, uploadRequest(t, "/extract", "slow.pdf", []byte("%PDF-1.7\nslow")))
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504 when the parse exceeds EXTRACTION_TIMEOUT (%s)", rec.Code, rec.Body.String())
+	}
+	m := decodeProblem(t, rec)
+	if !strings.HasSuffix(m["type"].(string), "/"+domain.ErrorTypeTimeout) {
+		t.Errorf("type = %v, want to end in /timeout", m["type"])
+	}
 }

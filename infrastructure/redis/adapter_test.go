@@ -103,7 +103,9 @@ func TestAdapter_CorruptEntryDegradesToMiss(t *testing.T) {
 
 	// Simulate a truncated/garbage write (e.g. a partial flush or a foreign
 	// writer). It must read as a miss so the caller re-parses.
-	srv.Set(redisadapter.DefaultKeyPrefix+key, "{not json")
+	if err := srv.Set(redisadapter.DefaultKeyPrefix+key, "{not json"); err != nil {
+		t.Fatalf("seed corrupt entry: %v", err)
+	}
 	if _, _, ok := a.Get(ctx, key); ok {
 		t.Error("a corrupt entry must report a miss, not a hit")
 	}
