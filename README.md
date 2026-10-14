@@ -9,7 +9,7 @@
 
 ## 1. Contexto y Entregables
 
-Este repositorio contiene la implementación completa de un microservicio en **Go 1.27** dedicado a la extracción de texto de documentos PDF mediante **MuPDF (go-fitz)**. La solución está diseñada para operar detrás de **Traefik** como *reverse proxy*, compartiendo infraestructura de datos (MongoDB y Redis) con un monolito preexistente mediante redes Docker externas.
+Este repositorio contiene la implementación completa de un microservicio en **Go 1.27** dedicado a la extracción de texto de documentos PDF mediante **MuPDF (go-fitz)**. La solución está diseñada para operar detrás de **Traefik** como *reverse proxy*, compartiendo la caché **Redis** con un monolito preexistente mediante redes Docker externas.
 
 ### Entregables Incluidos
 
@@ -17,17 +17,17 @@ Este repositorio contiene la implementación completa de un microservicio en **G
 |-----------|-------------|
 | **Código Fuente** | Implementación modular bajo arquitectura N-Layer (`domain`, `application`, `infrastructure`, `presentation`, `config`, `cmd/api`). |
 | **`Dockerfile`** | Imagen multi-stage optimizada (builder + runtime distroless) para compilación reproducible. |
-| **`docker-compose.yml`** | Orquestación local con 5 réplicas del servicio (`--scale api=5`), límites de recursos (`cpus: 1.0`, `memory: 1G`), healthchecks y red compartida `pdfextract_shared`. |
+| **`docker-compose.yml`** | Orquestación local con 5 réplicas del servicio (`--scale api=5`), límites de recursos (`cpus: 1.0`, `memory: 1G`), healthchecks y red compartida `test_network`. |
 | **`config/config.go`** | Carga y validación estricta de configuración vía variables de entorno (Twelve-Factor). |
-| **Suite de Pruebas** | Cobertura completa: unitarias (`go test -race ./...`), integración (Mongo/Redis reales), y carga (k6 / vegeta). |
+| **Suite de Pruebas** | Cobertura completa: unitarias (`go test -race ./...`), integración (Redis real), y carga (k6 / vegeta). |
 | **Scripts de Carga** | `k6` para *Spike Test* (ráfaga 100 VUs) y `vegeta` para carga constante sostenida. |
 
 ### Despliegue Reproducible
 
 ```bash
-# Infraestructura compartida (Mongo + Redis + Traefik)
-docker compose -f pdfextract/docker-compose.db.yml up -d
-docker compose -f pdfextract/docker-compose.traefik.yml up -d
+# Infraestructura compartida (Redis + Traefik)
+docker compose -f microservicio-db/docker-compose.yml up -d
+docker compose -f monolitico/docker-compose.traefik.yml up -d
 
 # Microservicio: 5 réplicas detrás del mismo Traefik
 docker compose -f microservicio-go/docker-compose.yml up -d --scale api=5
@@ -68,8 +68,7 @@ if v >= cfg.ExtractionTimeout {
 El microservicio es **completamente stateless**:
 
 - **Cero estado en memoria:** Cada réplica procesa peticiones independientemente.
-- **Estado delegado:** La caché de extracciones reside en **Redis** (clave = SHA-256 del binario PDF, prefijo `pdf:extract:`).
-- **Persistencia delegada:** Registros de auditoría en **MongoDB** (`ExtractionRecord`).
+- **Estado delegado:** La caché de extracciones reside en **Redis** (clave = SHA-256 del binario PDF, prefijo `pdf:extract:`). El extractor no persiste nada: la fuente de verdad de los documentos es el microservicio DB.
 - **Escalamiento horizontal:** `docker compose --scale api=N` añade réplicas sin migración de datos ni *sticky sessions*.
 
 ### 2.3 Port Binding y Logs (Factores VII y XI)
@@ -88,13 +87,12 @@ domain/                  → Núcleo puro: entidades, puertos (interfaces), erro
 application/             → Casos de uso: ExtractTextUseCase, gate, singleflight, cache-warming
 infrastructure/
   ├── fitz/              → Adapter MuPDF (DocumentProcessor)
-  ├── mongo/             → Adapter MongoDB (ExtractionRepository)
   └── redis/             → Adapter Redis (Cache)
 presentation/            → HTTP (Gin): Handler, Router, RFC 9457 Problem Details
 ```
 
 **Principios aplicados:**
-- **SOLID:** Interfaces pequeñas (`DocumentProcessor`, `Cache`, `ExtractionRepository`, `HealthChecker`), inyección por constructor, cero dependencias cíclicas.
+- **SOLID:** Interfaces pequeñas (`DocumentProcessor`, `Cache`, `HealthChecker`), inyección por constructor, cero dependencias cíclicas.
 - **DRY / KISS:** Lógica de clasificación de errores centralizada (`domain.SlugFor`, `application.classify`), *gate* de concurrencia con `chan struct{}` (sin librerías externas), *coalescing* con `singleflight.Group`.
 - **YAGNI:** Sin *frameworks* de DI, sin generics especulativos, sin capas innecesarias.
 
@@ -111,7 +109,7 @@ El desarrollo siguió un ciclo iterativo de **observación → hipótesis → ex
 **Análisis de Causa Raíz:** La extracción de texto es *CPU-bound* e *I/O-bound* (CGo → MuPDF). Documentos idénticos se re-procesaban en cada petición.
 
 **Solución Implementada:** **Redis Cache** con clave determinista **SHA-256(contenido PDF)**.
-- **Hit de caché:** Respuesta inmediata (200 OK), **cero CPU**, cero MuPDF, cero Mongo.
+- **Hit de caché:** Respuesta inmediata (200 OK), **cero CPU**, cero MuPDF, cero parseo.
 - **Miss de caché:** Parseo → Persistencia → *Warm cache* (contexto desacoplado `context.WithoutCancel`).
 - **Coalescing:** `singleflight.Group` evita *stampede* — N peticiones concurrentes del mismo PDF parsean **una sola vez**.
 
@@ -156,7 +154,7 @@ El desarrollo siguió un ciclo iterativo de **observación → hipótesis → ex
                       ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ EXTRACCIÓN (Timeout = 30s)                                  │
-│   MuPDF parsea → Persiste Mongo → Warm Redis (TTL 24h)      │
+│   MuPDF parsea → Warm Redis (TTL 24h)                       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -230,18 +228,18 @@ ratelimit:
 #### Estabilidad 100% (Cero Errores)
 - **Rechazo controlado (429):** Solo bajo saturación real (cola llena + timeout agotado), nunca por *race conditions*.
 - **Retry-After:** Clientes retroceden exponencialmente, evitando *thundering herd* en recuperación.
-- **Healthchecks compuestos (Mongo + Redis):** Traefik drena tráfico de réplicas degradadas *antes* de que fallen.
+- **Healthcheck (Redis):** Traefik drena tráfico de réplicas degradadas *antes* de que fallen.
 
 ### 4.3 Lecciones Arquitectónicas
 
 | Principio | Aplicación Concreta |
 |-----------|---------------------|
-| **Cache-Aside + Write-Through** | Miss: parse → persist → warm cache. Hit: serve directly. |
+| **Cache-Aside + Write-Through** | Miss: parse → warm cache. Hit: serve directly. |
 | **Bounded Concurrency** | `chan struct{}` en tres niveles: Queue → RAM → Parse. |
 | **Timeouts Asimétricos** | Admission (15s) ≪ Extraction (30s) ≪ Cache RTT (2s). |
-| **Fail-Fast Construction** | `NewAdapter`/`NewRepository` hacen ping al arranque; fallo rápido = no *silent degradation*. |
+| **Fail-Fast Construction** | `NewAdapter` hace ping al arranque; fallo rápido = no *silent degradation*. |
 | **Observabilidad por Diseño** | RFC 9457 en *todas* las respuestas de error; `X-Request-ID` correlacionado en `instance`. |
-| **Graceful Degradation** | Redis down → cache miss (re-parse), no error. Mongo down → health 503, extracciones siguen funcionando. |
+| **Graceful Degradation** | Redis down → health 503 (única dependencia); el extractor no arranca con la caché inaccesible. |
 
 ---
 

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"runtime"
 	"strings"
 	"time"
@@ -14,8 +13,6 @@ import (
 
 	"microservicio-go/domain"
 )
-
-const pdfMimeType = "application/pdf"
 
 const (
 	// defaultCacheTimeout bounds a single Redis round trip.
@@ -83,14 +80,14 @@ func (g *gate) release() { <-g.workers }
 
 // ExtractTextUseCase orchestrates extraction: it validates input, consults the
 // cache by content hash, coalesces concurrent misses for the same document,
-// queues work behind a bounded gate, calls the processor, and always persists
-// an ExtractionRecord. It depends only on domain interfaces.
+// queues work behind a bounded gate and calls the processor. It is stateless:
+// the only state it touches is the cache, and it depends only on domain
+// interfaces.
 type ExtractTextUseCase struct {
-	processor  domain.DocumentProcessor
-	repository domain.ExtractionRepository
-	cache      domain.Cache
-	gate       gate
-	inflight   singleflight.Group
+	processor domain.DocumentProcessor
+	cache     domain.Cache
+	gate      gate
+	inflight  singleflight.Group
 	// cacheTimeout bounds one Redis round trip.
 	cacheTimeout time.Duration
 }
@@ -98,7 +95,7 @@ type ExtractTextUseCase struct {
 // NewExtractTextUseCase builds the use case. A nil cache disables caching
 // (every call re-parses), which is only intended for tests and cache-less
 // deployments.
-func NewExtractTextUseCase(p domain.DocumentProcessor, r domain.ExtractionRepository, c domain.Cache, limits Limits) *ExtractTextUseCase {
+func NewExtractTextUseCase(p domain.DocumentProcessor, c domain.Cache, limits Limits) *ExtractTextUseCase {
 	if limits.Workers <= 0 {
 		limits.Workers = runtime.NumCPU()
 	}
@@ -110,7 +107,6 @@ func NewExtractTextUseCase(p domain.DocumentProcessor, r domain.ExtractionReposi
 	}
 	return &ExtractTextUseCase{
 		processor:    p,
-		repository:   r,
 		cache:        c,
 		gate:         gate{workers: make(chan struct{}, limits.Workers), admit: limits.Admission},
 		cacheTimeout: limits.CacheTimeout,
@@ -121,16 +117,19 @@ func (uc *ExtractTextUseCase) Extract(ctx context.Context, in ExtractInput) (Ext
 	started := time.Now()
 
 	if len(in.Data) == 0 {
-		return uc.fail(ctx, in, started, domain.ErrEmptyInput, 0, 0)
+		return ExtractOutput{}, domain.ErrEmptyInput
 	}
 	if strings.TrimSpace(in.Filename) == "" {
-		return uc.fail(ctx, in, started, domain.ErrEmptyInput, 0, 0)
+		return ExtractOutput{}, domain.ErrEmptyInput
 	}
 	if !isPDF(in.Data) {
-		return uc.fail(ctx, in, started, domain.ErrMalformedDocument, 0, 0)
+		return ExtractOutput{}, domain.ErrMalformedDocument
 	}
 
-	hash := sha256Hex(in.Data)
+	hash := in.Hash
+	if hash == "" {
+		hash = sha256Hex(in.Data)
+	}
 
 	// Fast path: identical bytes already parsed. Deliberately ahead of the
 	// gate: a cache hit needs no parser and no slot, so it must not queue
@@ -171,8 +170,8 @@ func (uc *ExtractTextUseCase) cachedExtract(ctx context.Context, hash string, st
 	}, true
 }
 
-// extractAndCache queues for a worker slot, parses, persists and warms the
-// cache. It must only run inside a singleflight key.
+// extractAndCache queues for a worker slot, parses and warms the cache. It must
+// only run inside a singleflight key.
 func (uc *ExtractTextUseCase) extractAndCache(ctx context.Context, in ExtractInput, hash string, started time.Time) (ExtractOutput, error) {
 	// Re-check inside the coalesced call: a sibling request may have just
 	// warmed the cache while this one waited for the singleflight key.
@@ -181,39 +180,26 @@ func (uc *ExtractTextUseCase) extractAndCache(ctx context.Context, in ExtractInp
 	}
 
 	// Wait for a parse slot. Exhausting the budget here is queueing latency, not a
-	// slow document, so it sheds with 429 and is not persisted. This holds
-	// whichever deadline fired: the admission budget or the extraction budget.
-	// Both mean the same thing — we never got to parse, so we must not claim
-	// the document took too long.
+	// slow document, so it sheds with 429. This holds whichever deadline fired:
+	// the admission budget or the extraction budget. Both mean the same thing —
+	// we never got to parse, so we must not claim the document took too long.
 	release, err := uc.gate.acquire(ctx)
 	if err != nil {
-		return uc.reject(domain.ErrOverloaded)
+		return ExtractOutput{}, domain.ErrOverloaded
 	}
-	defer release()
 
 	text, pages, err := uc.processor.ExtractText(ctx, in.Data)
+
+	// Free the parse slot before the cache write. The Redis round trip is not
+	// parsing, so it must not hold a slot another document is waiting for: the
+	// next parse can start while this one is being cached.
+	release()
+
 	if err != nil {
-		return uc.fail(ctx, in, started, classify(err), pages, len(text))
+		return ExtractOutput{}, classify(err)
 	}
 
 	uc.warmCache(ctx, hash, text, pages)
-
-	now := time.Now().UTC()
-	rec := &domain.ExtractionRecord{
-		Filename:      in.Filename,
-		MimeType:      pdfMimeType,
-		FileSizeBytes: int64(len(in.Data)),
-		PageCount:     pages,
-		TextLength:    len(text),
-		DurationMS:    time.Since(started).Milliseconds(),
-		SHA256:        hash,
-		Status:        domain.StatusSuccess,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}
-	if err := uc.repository.Save(ctx, rec); err != nil {
-		return ExtractOutput{}, fmt.Errorf("persist extraction record: %w", err)
-	}
 
 	return ExtractOutput{
 		Content:    text,
@@ -234,45 +220,9 @@ func (uc *ExtractTextUseCase) warmCache(ctx context.Context, hash, text string, 
 	_ = uc.cache.Set(writeCtx, hash, text, pages)
 }
 
-// fail records an error record (best-effort) and returns the classified error.
-func (uc *ExtractTextUseCase) fail(ctx context.Context, in ExtractInput, started time.Time, err error, pages, textLen int) (ExtractOutput, error) {
-	now := time.Now().UTC()
-	rec := &domain.ExtractionRecord{
-		Filename:      in.Filename,
-		MimeType:      pdfMimeTypeIf(in.Data),
-		FileSizeBytes: int64(len(in.Data)),
-		PageCount:     pages,
-		TextLength:    textLen,
-		DurationMS:    now.Sub(started).Milliseconds(),
-		SHA256:        sha256Hex(in.Data),
-		Status:        domain.StatusError,
-		Error:         domain.NewErrorDetails(classify(err)),
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}
-	_ = uc.repository.Save(ctx, rec)
-	return ExtractOutput{}, classify(err)
-}
-
-// reject refuses a request that we never attempted, without persisting a
-// record. Persistence here would be actively harmful: shedding is the response
-// to load we are already failing to absorb, so writing one Mongo document per
-// shed request would amplify exactly the overload it exists to relieve, and add
-// latency to a rejection that promises to be immediate.
-func (uc *ExtractTextUseCase) reject(err error) (ExtractOutput, error) {
-	return ExtractOutput{}, classify(err)
-}
-
 // isPDF returns whether data begins with the PDF magic bytes.
 func isPDF(data []byte) bool {
 	return len(data) >= 5 && string(data[:5]) == "%PDF-"
-}
-
-func pdfMimeTypeIf(data []byte) string {
-	if isPDF(data) {
-		return pdfMimeType
-	}
-	return ""
 }
 
 func sha256Hex(data []byte) string {
@@ -281,7 +231,7 @@ func sha256Hex(data []byte) string {
 }
 
 // classify normalizes a context deadline into the domain timeout sentinel so
-// the persisted record and the RFC 9457 mapping agree.
+// the RFC 9457 mapping is consistent.
 func classify(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return domain.ErrExtractionTimeout

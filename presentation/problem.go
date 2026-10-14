@@ -9,8 +9,7 @@ import (
 	"microservicio-go/domain"
 )
 
-// Presentation-only problem types (detected before the use case, so no
-// ExtractionRecord is persisted for them).
+// Presentation-only problem types (detected before the use case).
 const (
 	problemTypeTooLarge           = "too-large"
 	problemTypeServiceUnavailable = "service-unavailable"

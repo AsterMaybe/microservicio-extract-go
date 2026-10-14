@@ -1,4 +1,4 @@
-FROM golang:1.27.1-bookworm
+FROM golang:1.27.1-bookworm@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66
 
 # go-fitz ships precompiled MuPDF static libs; only a C compiler is
 # needed to build its small cgo shims. Dev/CI convenience image.
