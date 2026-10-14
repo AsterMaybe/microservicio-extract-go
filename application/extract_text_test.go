@@ -2,8 +2,6 @@ package application_test
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"strconv"
 	"sync"
@@ -45,31 +43,8 @@ func (b *blockingProcessor) ExtractText(ctx context.Context, _ []byte) (string, 
 	}
 }
 
-type stubRepository struct {
-	mu      sync.Mutex
-	saved   []*domain.ExtractionRecord
-	saveErr error
-}
-
-func (r *stubRepository) Save(_ context.Context, rec *domain.ExtractionRecord) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.saveErr != nil {
-		return r.saveErr
-	}
-	cp := *rec
-	r.saved = append(r.saved, &cp)
-	return nil
-}
-
-func (r *stubRepository) records() []*domain.ExtractionRecord {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.saved
-}
-
-func newUseCase(p domain.DocumentProcessor, r domain.ExtractionRepository, workers int) *application.ExtractTextUseCase {
-	return application.NewExtractTextUseCase(p, r, nil, application.Limits{Workers: workers})
+func newUseCase(p domain.DocumentProcessor, workers int) *application.ExtractTextUseCase {
+	return application.NewExtractTextUseCase(p, nil, application.Limits{Workers: workers})
 }
 
 // stubCache is an in-memory domain.Cache that records lookups and writes.
@@ -138,7 +113,7 @@ func (p *countingProcessor) callCount() int {
 func TestExtract_CacheMiss_ParsesAndWarmsCache(t *testing.T) {
 	processor := &countingProcessor{text: "cached body", pages: 3}
 	cache := newStubCache()
-	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 2})
+	uc := application.NewExtractTextUseCase(processor, cache, application.Limits{Workers: 2})
 
 	data := []byte("%PDF-1.7\ncacheable document")
 	out, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data})
@@ -159,7 +134,7 @@ func TestExtract_CacheMiss_ParsesAndWarmsCache(t *testing.T) {
 func TestExtract_CacheHit_SkipsParser(t *testing.T) {
 	processor := &countingProcessor{text: "cached body", pages: 3}
 	cache := newStubCache()
-	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 2})
+	uc := application.NewExtractTextUseCase(processor, cache, application.Limits{Workers: 2})
 
 	data := []byte("%PDF-1.7\ncacheable document")
 	first, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data})
@@ -180,28 +155,10 @@ func TestExtract_CacheHit_SkipsParser(t *testing.T) {
 	}
 }
 
-func TestExtract_CacheHit_SkipsPersistence(t *testing.T) {
-	processor := &countingProcessor{text: "t", pages: 1}
-	repo := &stubRepository{}
-	cache := newStubCache()
-	uc := application.NewExtractTextUseCase(processor, repo, cache, application.Limits{Workers: 2})
-
-	data := []byte("%PDF-1.7\nrepeat")
-	if _, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data}); err != nil {
-		t.Fatalf("first Extract: %v", err)
-	}
-	if _, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "a.pdf", Data: data}); err != nil {
-		t.Fatalf("second Extract: %v", err)
-	}
-	if recs := repo.records(); len(recs) != 1 {
-		t.Errorf("records = %d, want 1: a cache hit must not persist again", len(recs))
-	}
-}
-
 func TestExtract_ConcurrentSameDocument_ParsesOnce(t *testing.T) {
 	processor := &countingProcessor{text: "coalesced", pages: 2}
 	cache := newStubCache()
-	uc := application.NewExtractTextUseCase(processor, &stubRepository{}, cache, application.Limits{Workers: 4})
+	uc := application.NewExtractTextUseCase(processor, cache, application.Limits{Workers: 4})
 
 	data := []byte("%PDF-1.7\nstampede candidate")
 	const n = 12
@@ -235,8 +192,7 @@ func TestExtract_ConcurrentSameDocument_ParsesOnce(t *testing.T) {
 
 func TestExtract_AdmissionWindowElapsedShedsWithOverloaded(t *testing.T) {
 	blocking := &blockingProcessor{started: make(chan struct{}), release: make(chan struct{})}
-	repo := &stubRepository{}
-	uc := application.NewExtractTextUseCase(blocking, repo, nil, application.Limits{Workers: 1})
+	uc := application.NewExtractTextUseCase(blocking, nil, application.Limits{Workers: 1})
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -265,11 +221,6 @@ func TestExtract_AdmissionWindowElapsedShedsWithOverloaded(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first extraction failed: %v", err)
 	}
-
-	// A refusal is not an attempt, so only the completed request is recorded.
-	if got := len(repo.records()); got != 1 {
-		t.Errorf("persisted %d record(s), want 1 (only the completed request)", got)
-	}
 }
 
 // blockedProcessor blocks every call until release is closed, so N requests can
@@ -296,8 +247,7 @@ func (b *blockedProcessor) ExtractText(ctx context.Context, _ []byte) (string, i
 // the HTTP layer (see TestExtract_FullQueueShedsImmediately there).
 func TestExtract_ConcurrentMissesWaitForSlotsThenAllSucceed(t *testing.T) {
 	processor := &blockedProcessor{release: make(chan struct{})}
-	repo := &stubRepository{}
-	uc := application.NewExtractTextUseCase(processor, repo, nil, application.Limits{
+	uc := application.NewExtractTextUseCase(processor, nil, application.Limits{
 		Workers: 1, // one parse at a time
 	})
 
@@ -343,29 +293,9 @@ func TestExtract_ConcurrentMissesWaitForSlotsThenAllSucceed(t *testing.T) {
 	}
 }
 
-// TestExtract_RealFailureStillPersists guards the other side of the rule: only
-// refusals skip persistence. A document that genuinely fails to extract is a
-// useful record and must still be stored.
-func TestExtract_RealFailureStillPersists(t *testing.T) {
-	repo := &stubRepository{}
-	uc := application.NewExtractTextUseCase(
-		&stubProcessor{err: domain.ErrMalformedDocument}, repo, nil, application.Limits{Workers: 1})
-
-	if _, err := uc.Extract(context.Background(), application.ExtractInput{
-		Filename: "broken.pdf",
-		Data:     pdfMagic,
-	}); !errors.Is(err, domain.ErrMalformedDocument) {
-		t.Fatalf("err = %v, want ErrMalformedDocument", err)
-	}
-	if got := len(repo.records()); got != 1 {
-		t.Errorf("persisted %d record(s), want 1: a real extraction failure must be recorded", got)
-	}
-}
-
 func TestExtract_Success(t *testing.T) {
 	processor := &stubProcessor{text: "hello pdf text", pages: 4}
-	repo := &stubRepository{}
-	uc := newUseCase(processor, repo, 2)
+	uc := newUseCase(processor, 2)
 
 	data := []byte("%PDF-1.7\nhello pdf text")
 	out, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "report.pdf", Data: data})
@@ -382,35 +312,10 @@ func TestExtract_Success(t *testing.T) {
 	if out.DurationMS < 0 {
 		t.Errorf("DurationMS = %d, want >= 0", out.DurationMS)
 	}
-
-	recs := repo.records()
-	if len(recs) != 1 {
-		t.Fatalf("saved %d records, want 1", len(recs))
-	}
-	rec := recs[0]
-	if rec.Status != domain.StatusSuccess {
-		t.Errorf("Status = %q, want %q", rec.Status, domain.StatusSuccess)
-	}
-	if rec.Error != nil {
-		t.Errorf("Error = %+v, want nil on success", rec.Error)
-	}
-	if rec.Filename != "report.pdf" || rec.PageCount != 4 || rec.TextLength != len("hello pdf text") {
-		t.Errorf("record fields wrong: %+v", rec)
-	}
-	if rec.FileSizeBytes != int64(len(data)) {
-		t.Errorf("FileSizeBytes = %d, want %d", rec.FileSizeBytes, len(data))
-	}
-	sum := sha256.Sum256(data)
-	if rec.SHA256 != hex.EncodeToString(sum[:]) {
-		t.Errorf("SHA256 = %q, want %q", rec.SHA256, hex.EncodeToString(sum[:]))
-	}
-	if rec.CreatedAt.IsZero() || rec.UpdatedAt.IsZero() {
-		t.Errorf("timestamps must be set")
-	}
 }
 
 func TestExtract_MimeDerivedFromContent(t *testing.T) {
-	uc := newUseCase(&stubProcessor{text: "t", pages: 1}, &stubRepository{}, 2)
+	uc := newUseCase(&stubProcessor{text: "t", pages: 1}, 2)
 	out, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "x", Data: pdfMagic})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
@@ -421,7 +326,7 @@ func TestExtract_MimeDerivedFromContent(t *testing.T) {
 }
 
 func TestExtract_ExtensionLowercased(t *testing.T) {
-	uc := newUseCase(&stubProcessor{text: "t", pages: 1}, &stubRepository{}, 2)
+	uc := newUseCase(&stubProcessor{text: "t", pages: 1}, 2)
 	out, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "REPORT.PDF", Data: pdfMagic})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
@@ -431,80 +336,55 @@ func TestExtract_ExtensionLowercased(t *testing.T) {
 	}
 }
 
-func assertOneErrorRecord(t *testing.T, repo *stubRepository, wantType string) {
-	t.Helper()
-	recs := repo.records()
-	if len(recs) != 1 {
-		t.Fatalf("saved %d records, want 1", len(recs))
-	}
-	rec := recs[0]
-	if rec.Status != domain.StatusError || rec.Error == nil {
-		t.Fatalf("expected error record, got: %+v", rec)
-	}
-	if rec.Error.Type != wantType {
-		t.Errorf("Error.Type = %q, want %q", rec.Error.Type, wantType)
-	}
-	if rec.Error.Message == "" {
-		t.Errorf("Error.Message must not be empty")
-	}
-}
-
 func TestExtract_RejectsNonPDF(t *testing.T) {
-	repo := &stubRepository{}
-	uc := newUseCase(&stubProcessor{}, repo, 2)
+	uc := newUseCase(&stubProcessor{}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "nope.txt", Data: []byte("not a pdf at all")})
 	if !errors.Is(err, domain.ErrMalformedDocument) {
 		t.Fatalf("err = %v, want ErrMalformedDocument", err)
 	}
-	assertOneErrorRecord(t, repo, domain.ErrorTypeMalformedPDF)
 }
 
 func TestExtract_EmptyInput(t *testing.T) {
-	repo := &stubRepository{}
-	uc := newUseCase(&stubProcessor{}, repo, 2)
+	uc := newUseCase(&stubProcessor{}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "empty.pdf", Data: []byte{}})
 	if !errors.Is(err, domain.ErrEmptyInput) {
 		t.Fatalf("err = %v, want ErrEmptyInput", err)
 	}
-	assertOneErrorRecord(t, repo, domain.ErrorTypeInvalidFile)
 }
 
 func TestExtract_EmptyFilename(t *testing.T) {
-	uc := newUseCase(&stubProcessor{}, &stubRepository{}, 2)
+	uc := newUseCase(&stubProcessor{}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "", Data: pdfMagic})
 	if !errors.Is(err, domain.ErrEmptyInput) {
 		t.Fatalf("err = %v, want ErrEmptyInput", err)
 	}
 }
 
-func TestExtract_ProcessorError_PersistedAsMalformed(t *testing.T) {
-	repo := &stubRepository{}
-	uc := newUseCase(&stubProcessor{err: domain.ErrMalformedDocument}, repo, 2)
+func TestExtract_ProcessorError_MapsToMalformed(t *testing.T) {
+	uc := newUseCase(&stubProcessor{err: domain.ErrMalformedDocument}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "corrupt.pdf", Data: pdfMagic})
 	if !errors.Is(err, domain.ErrMalformedDocument) {
 		t.Fatalf("err = %v, want ErrMalformedDocument", err)
 	}
-	assertOneErrorRecord(t, repo, domain.ErrorTypeMalformedPDF)
 }
 
-func TestExtract_ProcessorUnknownError_PersistedAsInternal(t *testing.T) {
-	repo := &stubRepository{}
-	uc := newUseCase(&stubProcessor{err: errors.New("boom")}, repo, 2)
+func TestExtract_ProcessorUnknownError_SurfacesAsInternal(t *testing.T) {
+	uc := newUseCase(&stubProcessor{err: errors.New("boom")}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "x.pdf", Data: pdfMagic})
 	if err == nil || errors.Is(err, domain.ErrMalformedDocument) || errors.Is(err, domain.ErrEmptyInput) {
 		t.Fatalf("err = %v, want the raw unexpected error", err)
 	}
-	assertOneErrorRecord(t, repo, domain.ErrorTypeInternal)
+	if got := domain.SlugFor(err); got != domain.ErrorTypeInternal {
+		t.Errorf("SlugFor = %q, want %q", got, domain.ErrorTypeInternal)
+	}
 }
 
-func TestExtract_ProcessorDeadline_PersistedAsTimeout(t *testing.T) {
-	repo := &stubRepository{}
-	uc := newUseCase(&stubProcessor{err: context.DeadlineExceeded}, repo, 2)
+func TestExtract_ProcessorDeadline_MapsToTimeout(t *testing.T) {
+	uc := newUseCase(&stubProcessor{err: context.DeadlineExceeded}, 2)
 	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "x.pdf", Data: pdfMagic})
 	if !errors.Is(err, domain.ErrExtractionTimeout) {
 		t.Fatalf("err = %v, want ErrExtractionTimeout", err)
 	}
-	assertOneErrorRecord(t, repo, domain.ErrorTypeTimeout)
 }
 
 // TestExtract_CancelledWhileWaiting_ShedsAsOverloadedNotTimeout pins the
@@ -514,8 +394,7 @@ func TestExtract_ProcessorDeadline_PersistedAsTimeout(t *testing.T) {
 // advice exactly when the service is under pressure.
 func TestExtract_CancelledWhileWaiting_ShedsAsOverloadedNotTimeout(t *testing.T) {
 	blocking := &blockingProcessor{started: make(chan struct{}), release: make(chan struct{})}
-	repo := &stubRepository{}
-	uc := newUseCase(blocking, repo, 1)
+	uc := newUseCase(blocking, 1)
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	defer cancel1()
@@ -545,18 +424,5 @@ func TestExtract_CancelledWhileWaiting_ShedsAsOverloadedNotTimeout(t *testing.T)
 	close(blocking.release)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first extraction failed: %v", err)
-	}
-}
-
-func TestExtract_RepositoryFailure_SurfacesToCaller(t *testing.T) {
-	saveErr := errors.New("mongo down")
-	repo := &stubRepository{saveErr: saveErr}
-	uc := newUseCase(&stubProcessor{text: "t", pages: 1}, repo, 2)
-	_, err := uc.Extract(context.Background(), application.ExtractInput{Filename: "ok.pdf", Data: pdfMagic})
-	if !errors.Is(err, saveErr) {
-		t.Fatalf("err = %v, want the persistence error surfaced to the caller", err)
-	}
-	if recs := repo.records(); len(recs) != 0 {
-		t.Errorf("failed save must not append a record, got %d", len(recs))
 	}
 }

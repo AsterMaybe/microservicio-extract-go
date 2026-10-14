@@ -10,13 +10,10 @@ import (
 
 // Config holds the validated runtime configuration for the PDF extraction service.
 // All fields are populated from environment variables with sensible defaults.
-// Required: MONGODB_URI, REDIS_URL.
+// Required: REDIS_URL.
 type Config struct {
-	Port            string
-	MongoURI        string
-	MongoDB         string
-	MongoCollection string
-	RedisURL        string
+	Port     string
+	RedisURL string
 
 	// MaxUploadBytes caps the accepted multipart upload size, expressed in
 	// bytes internally. The MAX_UPLOAD_MB env var configures it in megabytes.
@@ -45,8 +42,6 @@ type Config struct {
 
 const (
 	defaultPort              = "8080"
-	defaultDB                = "pdf_extraction"
-	defaultCollection        = "extractions"
 	defaultMaxUploadBytes    = 25 * 1024 * 1024
 	defaultExtractionTimeout = 30 * time.Second
 	defaultMaxInFlight       = 32
@@ -66,9 +61,6 @@ const (
 func Load() (*Config, error) {
 	cfg := &Config{
 		Port:              getEnv("PORT", defaultPort),
-		MongoURI:          os.Getenv("MONGODB_URI"),
-		MongoDB:           getEnv("MONGODB_DB", defaultDB),
-		MongoCollection:   getEnv("MONGODB_COLLECTION", defaultCollection),
 		RedisURL:          os.Getenv("REDIS_URL"),
 		MaxUploadBytes:    defaultMaxUploadBytes,
 		ExtractionTimeout: defaultExtractionTimeout,
@@ -78,10 +70,6 @@ func Load() (*Config, error) {
 		CacheTimeout:      defaultCacheTimeout,
 		CacheTTL:          defaultCacheTTL,
 		ErrBaseURL:        getEnv("ERR_BASE_URL", defaultErrBaseURL),
-	}
-
-	if cfg.MongoURI == "" {
-		return nil, fmt.Errorf("MONGODB_URI is required")
 	}
 
 	if cfg.RedisURL == "" {

@@ -342,7 +342,7 @@ func TestHealth_Ok(t *testing.T) {
 }
 
 func TestHealth_Unavailable_Returns503Problem(t *testing.T) {
-	router := newTestRouter(t, &stubExtractor{}, &stubPinger{err: errors.New("mongo unreachable")}, testConfig())
+	router := newTestRouter(t, &stubExtractor{}, &stubPinger{err: errors.New("redis unreachable")}, testConfig())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
 	rec := perform(t, router, req)

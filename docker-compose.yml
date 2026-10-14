@@ -1,5 +1,5 @@
 # Microservicio Go (extracción de PDF) — se publica únicamente a través de
-# Traefik (misma infraestructura que pdfextract). No publica puertos: todo el
+# Traefik (misma infraestructura que el monolito). No publica puertos: todo el
 # tráfico entra por el gateway vía labels.
 # Proyecto aislado: evita que `docker compose up` de otra ficha borre los
 # contenedores de las demás (todas comparten la red externa).
@@ -12,19 +12,26 @@ services:
       dockerfile: Dockerfile
     image: microservicio-api:0.1.0
     restart: unless-stopped
+    # Inmutabilidad en runtime (D1/D4): UID/GID fijo, rootfs de solo lectura,
+    # sin capabilities y sin escalada de privilegios.
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
     expose:
       - "8080"
     environment:
-      # Credenciales/red compartidas con pdfextract (mongo corre en esta red).
-      - MONGODB_URI=mongodb://${MONGO_USER:-admin}:${MONGO_PASSWORD:-password}@mongo:27017
-      # Colección propia: no reutilices `extracted_texts` (schema del monolito).
-      - MONGODB_DB=${GO_MONGODB_DB:-pdf_extraction}
-      - MONGODB_COLLECTION=${GO_MONGODB_COLLECTION:-extractions}
+      # El extractor es stateless: su única dependencia de datos es Redis
+      # (caché por SHA-256), que corre en la red compartida con el monolito.
       - GIN_MODE=${GIN_MODE:-release}
       # Tamaño máximo de PDF en MB (default 25).
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-25}
       # Redis: caché de extracciones por SHA-256 del binario. Un hit devuelve
-      # 200 sin volver a parsear. Corre en la red compartida de pdfextract.
+      # 200 sin volver a parsear. Corre en la red compartida del monolito.
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       # CACHÉ: vida de cada entrada.
       - CACHE_TTL=${CACHE_TTL:-24h}
@@ -42,9 +49,15 @@ services:
       #   EXTRACTION_TIMEOUT presupuesto del parseo en sí -> 504
       - CONCURRENCY=${CONCURRENCY:-0}
       - QUEUE_SIZE=${QUEUE_SIZE:-200}
-      - MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-32}
+      - MAX_IN_FLIGHT=${MAX_IN_FLIGHT:-8}
       - ADMISSION_TIMEOUT=${ADMISSION_TIMEOUT:-2s}
       - EXTRACTION_TIMEOUT=${EXTRACTION_TIMEOUT:-30s}
+      # Control del GC de Go bajo el límite de 1 GiB de la cgroup. GOMEMLIMIT es
+      # un objetivo blando de heap: mantiene el uso por debajo del techo duro y
+      # evita el OOM. GOGC>100 espacia las colecciones (menos CPU en GC) a cambio
+      # de algo más de memoria, cubierta por GOMEMLIMIT.
+      - GOMEMLIMIT=${GOMEMLIMIT:-850MiB}
+      - GOGC=${GOGC:-150}
     labels:
       - "traefik.enable=true"
       # Red que Traefik debe usar para alcanzar este contenedor (la interpola compose).

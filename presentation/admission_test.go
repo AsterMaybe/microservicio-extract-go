@@ -37,10 +37,6 @@ func (h *hangProcessor) ExtractText(ctx context.Context, _ []byte) (string, int,
 	}
 }
 
-type noopRepo struct{}
-
-func (noopRepo) Save(context.Context, *domain.ExtractionRecord) error { return nil }
-
 // TestExtract_FullQueueShedsImmediately is FILTER 1. With QUEUE_SIZE places
 // taken and every parse slot busy, the next arrival must be refused with 429
 // without waiting and without reading the body.
@@ -54,7 +50,7 @@ func TestExtract_FullQueueShedsImmediately(t *testing.T) {
 
 	proc := &holdProcessor{release: make(chan struct{})}
 
-	uc := application.NewExtractTextUseCase(proc, noopRepo{}, nil, application.Limits{Workers: 1})
+	uc := application.NewExtractTextUseCase(proc, nil, application.Limits{Workers: 1})
 
 	cfg := testConfig()
 	cfg.QueueSize = queueSize
@@ -113,7 +109,7 @@ func TestExtract_AdmissionTimeoutShedsWith429(t *testing.T) {
 
 	// ADMISSION_TIMEOUT is one budget enforced at both waits: here for RAM to
 	// buffer the body, in the use case for a parse slot.
-	uc := application.NewExtractTextUseCase(proc, noopRepo{}, nil, application.Limits{
+	uc := application.NewExtractTextUseCase(proc, nil, application.Limits{
 		Workers:   1,
 		Admission: admission,
 	})
@@ -158,7 +154,7 @@ func TestExtract_QueuedBurstAbsorbsBeyondMaxInFlight(t *testing.T) {
 	cfg.AdmissionTimeout = 2 * time.Second
 	cfg.ExtractionTimeout = 30 * time.Second
 
-	uc := application.NewExtractTextUseCase(proc, noopRepo{}, nil, application.Limits{
+	uc := application.NewExtractTextUseCase(proc, nil, application.Limits{
 		Workers:   1,
 		Admission: cfg.AdmissionTimeout,
 	})
@@ -200,7 +196,7 @@ func TestExtract_QueuedBurstAbsorbsBeyondMaxInFlight(t *testing.T) {
 		t.Errorf("all %d requests were shed (%d of them); a queue of %d with 2 read slots should absorb part of the burst",
 			burst, shed, cfg.QueueSize)
 	}
-t.Logf("burst of %d: absorbed=%d shed429=%d", burst, absorbed, shed)
+	t.Logf("burst of %d: absorbed=%d shed429=%d", burst, absorbed, shed)
 }
 
 // TestExtract_ParseDeadlineExpired_Returns504 is the other half of the
@@ -217,7 +213,7 @@ func TestExtract_ParseDeadlineExpired_Returns504(t *testing.T) {
 	proc := &hangProcessor{release: make(chan struct{})}
 	defer close(proc.release)
 
-	uc := application.NewExtractTextUseCase(proc, noopRepo{}, nil, application.Limits{
+	uc := application.NewExtractTextUseCase(proc, nil, application.Limits{
 		Workers:   1,
 		Admission: 2 * time.Second, // must NOT be what fires
 	})

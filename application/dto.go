@@ -7,6 +7,11 @@ import "context"
 type ExtractInput struct {
 	Filename string
 	Data     []byte
+	// Hash is the optional hex SHA-256 of Data, computed by a caller that
+	// already streamed the bytes. When empty the use case computes it. It is
+	// only an optimisation: a wrong value reuses the wrong cache entry, so
+	// callers that set it must hash exactly Data.
+	Hash string
 }
 
 // ExtractOutput is the successful extraction result returned to the caller.

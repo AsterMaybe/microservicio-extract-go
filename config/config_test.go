@@ -10,14 +10,13 @@ import (
 
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"PORT", "MONGODB_URI", "MONGODB_DB", "MONGODB_COLLECTION", "REDIS_URL", "MAX_UPLOAD_MB", "EXTRACTION_TIMEOUT", "CONCURRENCY", "QUEUE_SIZE", "MAX_IN_FLIGHT", "ADMISSION_TIMEOUT", "REDIS_TIMEOUT", "CACHE_TTL", "ERR_BASE_URL"} {
+	for _, k := range []string{"PORT", "REDIS_URL", "MAX_UPLOAD_MB", "EXTRACTION_TIMEOUT", "CONCURRENCY", "QUEUE_SIZE", "MAX_IN_FLIGHT", "ADMISSION_TIMEOUT", "REDIS_TIMEOUT", "CACHE_TTL", "ERR_BASE_URL"} {
 		t.Setenv(k, "")
 	}
 }
 
 func TestLoad_Defaults(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MONGODB_URI", "mongodb://admin:password@mongo:27017")
 	t.Setenv("REDIS_URL", "redis://localhost:6379")
 
 	cfg, err := config.Load()
@@ -26,12 +25,6 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.Port != "8080" {
 		t.Errorf("Port = %q, want 8080", cfg.Port)
-	}
-	if cfg.MongoURI != "mongodb://admin:password@mongo:27017" {
-		t.Errorf("MongoURI wrong: %q", cfg.MongoURI)
-	}
-	if cfg.MongoDB != "pdf_extraction" || cfg.MongoCollection != "extractions" {
-		t.Errorf("Mongo naming defaults wrong: %q/%q", cfg.MongoDB, cfg.MongoCollection)
 	}
 	if cfg.RedisURL != "redis://localhost:6379" {
 		t.Errorf("RedisURL = %q, want redis://localhost:6379", cfg.RedisURL)
@@ -67,10 +60,7 @@ func TestLoad_Defaults(t *testing.T) {
 
 func TestLoad_RespectsOverrides(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MONGODB_URI", "mongodb://u:p@h:27017")
 	t.Setenv("REDIS_URL", "redis://redis:6379")
-	t.Setenv("MONGODB_DB", "custom_db")
-	t.Setenv("MONGODB_COLLECTION", "custom_col")
 	t.Setenv("PORT", "9090")
 	t.Setenv("MAX_UPLOAD_MB", "2")
 	t.Setenv("EXTRACTION_TIMEOUT", "5s")
@@ -84,7 +74,7 @@ func TestLoad_RespectsOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Port != "9090" || cfg.MongoDB != "custom_db" || cfg.MongoCollection != "custom_col" || cfg.RedisURL != "redis://redis:6379" || cfg.MaxUploadBytes != 2*1024*1024 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.MaxInFlight != 16 || cfg.ErrBaseURL != "https://errors.acme.dev" {
+	if cfg.Port != "9090" || cfg.RedisURL != "redis://redis:6379" || cfg.MaxUploadBytes != 2*1024*1024 || cfg.ExtractionTimeout != 5*time.Second || cfg.Concurrency != 4 || cfg.MaxInFlight != 16 || cfg.ErrBaseURL != "https://errors.acme.dev" {
 		t.Errorf("overrides not applied: %+v", cfg)
 	}
 	if cfg.QueueSize != 500 {
@@ -97,7 +87,6 @@ func TestLoad_RespectsOverrides(t *testing.T) {
 
 func TestLoad_AdmissionTimeoutRejectsLongerThanExtraction(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MONGODB_URI", "mongodb://admin:password@mongo:27017")
 	t.Setenv("REDIS_URL", "redis://redis:6379")
 	t.Setenv("ADMISSION_TIMEOUT", "60s")
 	t.Setenv("EXTRACTION_TIMEOUT", "30s")
@@ -112,7 +101,6 @@ func TestLoad_AdmissionTimeoutRejectsLongerThanExtraction(t *testing.T) {
 // shipped .env sets, so Load must accept it (negatives stay invalid).
 func TestLoad_ConcurrencyZeroIsValidSentinel(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MONGODB_URI", "mongodb://admin:password@mongo:27017")
 	t.Setenv("REDIS_URL", "redis://redis:6379")
 	t.Setenv("CONCURRENCY", "0")
 
@@ -131,9 +119,6 @@ func TestLoad_ConcurrencyZeroIsValidSentinel(t *testing.T) {
 func TestLoad_ComposeDefaultsAreLoadable(t *testing.T) {
 	clearEnv(t)
 	for k, v := range map[string]string{
-		"MONGODB_URI":        "mongodb://admin:password@mongo:27017",
-		"MONGODB_DB":         "pdf_extraction",
-		"MONGODB_COLLECTION": "extractions",
 		"REDIS_URL":          "redis://redis:6379",
 		"CACHE_TTL":          "24h",
 		"GIN_MODE":           "release",
@@ -157,20 +142,8 @@ func TestLoad_ComposeDefaultsAreLoadable(t *testing.T) {
 	}
 }
 
-func TestLoad_MissingMongoURI(t *testing.T) {
-	clearEnv(t)
-	_, err := config.Load()
-	if err == nil {
-		t.Fatal("expected error when MONGODB_URI is missing")
-	}
-	if !strings.Contains(err.Error(), "MONGODB_URI") {
-		t.Errorf("error should mention MONGODB_URI, got: %v", err)
-	}
-}
-
 func TestLoad_MissingRedisURL(t *testing.T) {
 	clearEnv(t)
-	t.Setenv("MONGODB_URI", "mongodb://admin:password@mongo:27017")
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("expected error when REDIS_URL is missing")
@@ -252,7 +225,6 @@ func TestLoad_InvalidValues(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clearEnv(t)
-			t.Setenv("MONGODB_URI", "mongodb://admin:password@mongo:27017")
 			t.Setenv("REDIS_URL", "redis://redis:6379")
 			for k, v := range tc.env {
 				t.Setenv(k, v)
