@@ -13,11 +13,12 @@ import (
 // fleet responses match the monolith's payloads instead of Traefik's default
 // plain-text bodies.
 func (h *Handler) TraefikError(c *gin.Context) {
+	cfg := h.currentConfig()
 	instance := c.Request.URL.Path
 	statusCode, err := strconv.Atoi(strings.TrimPrefix(c.Param("status"), "/"))
 	if err != nil {
 		// Nothing to map: malformed status is not part of the delegated contract.
-		writeProblemSlug(c, h.cfg.ErrBaseURL, "not-found", "Not Found", "", http.StatusNotFound, instance)
+		writeProblemSlug(c, cfg.ErrBaseURL, "not-found", "Not Found", "", http.StatusNotFound, instance)
 		return
 	}
 
@@ -32,9 +33,9 @@ func (h *Handler) TraefikError(c *gin.Context) {
 		title = "Service Unavailable"
 		detail = "El servicio no se encuentra disponible en este momento. Intente nuevamente más tarde."
 	default:
-		writeProblemSlug(c, h.cfg.ErrBaseURL, "not-found", "Not Found", "", http.StatusNotFound, instance)
+		writeProblemSlug(c, cfg.ErrBaseURL, "not-found", "Not Found", "", http.StatusNotFound, instance)
 		return
 	}
 
-	writeProblemSlug(c, h.cfg.ErrBaseURL, slug, title, detail, statusCode, instance)
+	writeProblemSlug(c, cfg.ErrBaseURL, slug, title, detail, statusCode, instance)
 }

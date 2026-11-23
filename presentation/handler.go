@@ -28,9 +28,9 @@ type Pinger interface {
 // then the time bound (the admission budget). It also formats RFC 9457
 // responses.
 type Handler struct {
-	extractor application.Extractor
-	pinger    Pinger
-	cfg       Config
+	extractor    application.Extractor
+	pinger       Pinger
+	cfgProvider  ConfigProvider
 	// inflight bounds how many upload bodies are held in RAM at once.
 	inflight chan struct{}
 	// queue is the bounded request queue (cap QueueSize). Taken BEFORE the body
@@ -72,7 +72,8 @@ type extractResponse struct {
 	PageCount int    `json:"page_count"`
 }
 
-func NewHandler(extractor application.Extractor, pinger Pinger, cfg Config) *Handler {
+func NewHandler(extractor application.Extractor, pinger Pinger, provider ConfigProvider) *Handler {
+	cfg := provider.Get()
 	if cfg.MaxInFlight <= 0 {
 		cfg.MaxInFlight = defaultMaxInFlight
 	}
@@ -83,16 +84,33 @@ func NewHandler(extractor application.Extractor, pinger Pinger, cfg Config) *Han
 		cfg.AdmissionTimeout = defaultAdmissionTimeout
 	}
 	return &Handler{
-		extractor: extractor,
-		pinger:    pinger,
-		cfg:       cfg,
-		queue:     make(chan struct{}, cfg.QueueSize),
-		inflight:  make(chan struct{}, cfg.MaxInFlight),
+		extractor:   extractor,
+		pinger:      pinger,
+		cfgProvider: provider,
+		queue:       make(chan struct{}, cfg.QueueSize),
+		inflight:    make(chan struct{}, cfg.MaxInFlight),
 	}
+}
+
+// currentConfig returns the current config snapshot with defaults applied (supports hot-reload).
+func (h *Handler) currentConfig() Config {
+	cfg := h.cfgProvider.Get()
+	// Apply defaults for any zero values (since config may come from Consul KV or env vars)
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = defaultMaxInFlight
+	}
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = defaultQueueSize
+	}
+	if cfg.AdmissionTimeout <= 0 {
+		cfg.AdmissionTimeout = defaultAdmissionTimeout
+	}
+	return cfg
 }
 
 // Extract handles POST /extract.
 func (h *Handler) Extract(c *gin.Context) {
+	cfg := h.currentConfig()
 	instance := c.Request.URL.Path
 
 	// FILTER 1 — space. The bounded queue. Rejection is immediate and never
@@ -102,13 +120,13 @@ func (h *Handler) Extract(c *gin.Context) {
 		defer func() { <-h.queue }()
 	default:
 		c.Header("Retry-After", retryAfterSeconds)
-		writeProblem(c, h.cfg.ErrBaseURL, domain.ErrorTypeOverloaded, instance)
+		writeProblem(c, cfg.ErrBaseURL, domain.ErrorTypeOverloaded, instance)
 		return
 	}
 
 	// The admission budget bounds how long an admitted request may wait for RAM
 	// to become available to buffer its body.
-	admitCtx, cancelAdmission := context.WithTimeout(c.Request.Context(), h.cfg.AdmissionTimeout)
+	admitCtx, cancelAdmission := context.WithTimeout(c.Request.Context(), cfg.AdmissionTimeout)
 	defer cancelAdmission()
 
 	// RAM guard. Now that the request holds a queue place it waits instead of
@@ -119,22 +137,22 @@ func (h *Handler) Extract(c *gin.Context) {
 		defer func() { <-h.inflight }()
 	case <-admitCtx.Done():
 		c.Header("Retry-After", retryAfterSeconds)
-		writeProblem(c, h.cfg.ErrBaseURL, domain.ErrorTypeOverloaded, instance)
+		writeProblem(c, cfg.ErrBaseURL, domain.ErrorTypeOverloaded, instance)
 		return
 	}
 
 	// Bound the whole body (file bytes + multipart framing) so a hostile upload
 	// cannot read without limit; the precise per-file cap is enforced while the
 	// file part is streamed below.
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.cfg.MaxUploadBytes+maxMultipartOverhead)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.MaxUploadBytes+maxMultipartOverhead)
 
 	filename, data, hash, err := h.readUpload(c)
 	if err != nil {
 		if isTooLarge(err) {
-			writeProblem(c, h.cfg.ErrBaseURL, problemTypeTooLarge, instance)
+			writeProblem(c, cfg.ErrBaseURL, problemTypeTooLarge, instance)
 			return
 		}
-		writeProblem(c, h.cfg.ErrBaseURL, domain.ErrorTypeInvalidFile, instance)
+		writeProblem(c, cfg.ErrBaseURL, domain.ErrorTypeInvalidFile, instance)
 		return
 	}
 
@@ -142,7 +160,7 @@ func (h *Handler) Extract(c *gin.Context) {
 	// admission budget: waiting for a slot must not eat into the time the
 	// caller's document is allowed to take, or a healthy but slow PDF would be
 	// misreported as overloaded.
-	extractCtx, cancelExtract := context.WithTimeout(c.Request.Context(), h.cfg.ExtractionTimeout)
+	extractCtx, cancelExtract := context.WithTimeout(c.Request.Context(), cfg.ExtractionTimeout)
 	defer cancelExtract()
 
 	out, err := h.extractor.Extract(extractCtx, application.ExtractInput{Filename: filename, Data: data, Hash: hash})
@@ -163,6 +181,7 @@ func (h *Handler) Extract(c *gin.Context) {
 // request dominated the service's RAM and GC. Streaming keeps one buffer and
 // yields the content hash for free.
 func (h *Handler) readUpload(c *gin.Context) (filename string, data []byte, hash string, err error) {
+	cfg := h.currentConfig()
 	mr, err := c.Request.MultipartReader()
 	if err != nil {
 		return "", nil, "", err
@@ -182,11 +201,11 @@ func (h *Handler) readUpload(c *gin.Context) (filename string, data []byte, hash
 		}
 
 		var buf bytes.Buffer
-		limited := io.LimitReader(part, h.cfg.MaxUploadBytes+1)
+		limited := io.LimitReader(part, cfg.MaxUploadBytes+1)
 		if _, cerr := io.Copy(&buf, io.TeeReader(limited, hasher)); cerr != nil {
 			return "", nil, "", cerr
 		}
-		if int64(buf.Len()) > h.cfg.MaxUploadBytes {
+		if int64(buf.Len()) > cfg.MaxUploadBytes {
 			return "", nil, "", errUploadTooLarge
 		}
 		// Drain the tail (closing boundary) so the connection can be reused.
@@ -197,18 +216,20 @@ func (h *Handler) readUpload(c *gin.Context) (filename string, data []byte, hash
 
 // Health handles GET /api/v1/health.
 func (h *Handler) Health(c *gin.Context) {
+	cfg := h.currentConfig()
 	instance := c.Request.URL.Path
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
 
 	if err := h.pinger.Ping(ctx); err != nil {
-		writeProblem(c, h.cfg.ErrBaseURL, problemTypeServiceUnavailable, instance)
+		writeProblem(c, cfg.ErrBaseURL, problemTypeServiceUnavailable, instance)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (h *Handler) writeExtractionError(c *gin.Context, err error) {
+	cfg := h.currentConfig()
 	slug := domain.SlugFor(err)
 	if errors.Is(err, context.DeadlineExceeded) {
 		slug = domain.ErrorTypeTimeout
@@ -218,7 +239,7 @@ func (h *Handler) writeExtractionError(c *gin.Context, err error) {
 		// real clients can back off instead of hot-looping on a 429/503.
 		c.Header("Retry-After", retryAfterSeconds)
 	}
-	writeProblem(c, h.cfg.ErrBaseURL, slug, c.Request.URL.Path)
+	writeProblem(c, cfg.ErrBaseURL, slug, c.Request.URL.Path)
 }
 
 // isTooLarge detects the size cut-offs: our streaming file-part limit, the

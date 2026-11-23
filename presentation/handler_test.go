@@ -75,7 +75,7 @@ func testConfig() presentation.Config {
 func newTestRouter(t *testing.T, ex application.Extractor, p presentation.Pinger, cfg presentation.Config) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	return presentation.NewRouter(ex, p, cfg)
+	return presentation.NewRouter(ex, p, presentation.NewStaticConfigProvider(cfg))
 }
 
 func uploadRequest(t *testing.T, path, filename string, data []byte) *http.Request {
