@@ -5,7 +5,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"microservicio-go/consul"
 )
 
 // Config holds the validated runtime configuration for the PDF extraction service.
@@ -38,6 +41,10 @@ type Config struct {
 	// CacheTTL bounds the lifetime of a cached extraction result.
 	CacheTTL   time.Duration
 	ErrBaseURL string
+
+	// ConfigWatcher allows hot-reloading of tunable parameters from Consul KV.
+	// If nil, falls back to environment variables only.
+	ConfigWatcher *consul.ConfigWatcher
 }
 
 const (
@@ -76,80 +83,9 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("REDIS_URL is required")
 	}
 
-	if raw := os.Getenv("MAX_UPLOAD_MB"); raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("MAX_UPLOAD_MB must be a positive integer of megabytes (e.g. 25), got %q", raw)
-		}
-		cfg.MaxUploadBytes = v * 1024 * 1024
-	}
-
-	if raw := os.Getenv("EXTRACTION_TIMEOUT"); raw != "" {
-		v, err := time.ParseDuration(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("EXTRACTION_TIMEOUT must be a positive duration (e.g. 30s), got %q", raw)
-		}
-		cfg.ExtractionTimeout = v
-	}
-
-	if raw := os.Getenv("CONCURRENCY"); raw != "" {
-		v, err := strconv.Atoi(raw)
-		// 0 is a valid sentinel meaning "one slot per CPU" (the use case
-		// resolves it to NumCPU), so only negatives are rejected here.
-		if err != nil || v < 0 {
-			return nil, fmt.Errorf("CONCURRENCY must be a non-negative integer (0 or unset for CPU count), got %q", raw)
-		}
-		cfg.Concurrency = v
-	}
-
-	if raw := os.Getenv("QUEUE_SIZE"); raw != "" {
-		v, err := strconv.Atoi(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("QUEUE_SIZE must be a positive integer: it is how many requests may wait for an extraction slot before the service sheds (e.g. 200), got %q", raw)
-		}
-		cfg.QueueSize = v
-	}
-
-	if raw := os.Getenv("REDIS_TIMEOUT"); raw != "" {
-		v, err := time.ParseDuration(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("REDIS_TIMEOUT must be a positive duration (e.g. 2s), got %q", raw)
-		}
-		cfg.CacheTimeout = v
-	}
-
-	if raw := os.Getenv("MAX_IN_FLIGHT"); raw != "" {
-		v, err := strconv.Atoi(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("MAX_IN_FLIGHT must be a positive integer (or unset for the default), got %q", raw)
-		}
-		cfg.MaxInFlight = v
-	}
-
-	if raw := os.Getenv("ADMISSION_TIMEOUT"); raw != "" {
-		v, err := time.ParseDuration(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("ADMISSION_TIMEOUT must be a positive duration (e.g. 2s), got %q", raw)
-		}
-		if v >= cfg.ExtractionTimeout {
-			return nil, fmt.Errorf("ADMISSION_TIMEOUT (%s) must be shorter than EXTRACTION_TIMEOUT (%s), got %q", v, cfg.ExtractionTimeout, raw)
-		}
-		cfg.AdmissionTimeout = v
-	}
-
-	if raw := os.Getenv("CACHE_TTL"); raw != "" {
-		v, err := time.ParseDuration(raw)
-		if err != nil || v <= 0 {
-			return nil, fmt.Errorf("CACHE_TTL must be a positive duration (e.g. 24h), got %q", raw)
-		}
-		cfg.CacheTTL = v
-	}
-
-	if raw := os.Getenv("ERR_BASE_URL"); raw != "" {
-		if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://") {
-			return nil, fmt.Errorf("ERR_BASE_URL must be an http(s) URI, got %q", raw)
-		}
-		cfg.ErrBaseURL = raw
+	// Apply env var overrides with validation (used as fallback when Consul unavailable)
+	if err := applyEnvOverrides(cfg); err != nil {
+		return nil, err
 	}
 
 	if _, err := strconv.Atoi(cfg.Port); err != nil {
@@ -159,9 +95,211 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// LoadWithWatcher loads config and initializes Consul KV watcher for hot-reload.
+func LoadWithWatcher(consulAddress, consulToken string) (*Config, *consul.ConfigWatcher, error) {
+	cfg, err := Load()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create config watcher for hot-reloadable parameters
+	watcher, err := consul.NewConfigWatcher(consul.ConfigWatcherConfig{
+		ConsulAddress: consulAddress,
+		ConsulToken:   consulToken,
+		Prefix:        "config/microservicio-go/",
+		OnChange:      func(kv map[string]string) { /* Hot-reload handled via atomic access */ },
+	})
+	if err != nil {
+		// Non-fatal: log and continue without hot-reload
+		return cfg, nil, err
+	}
+
+	cfg.ConfigWatcher = watcher
+	return cfg, watcher, nil
+}
+
+// GetMaxUploadBytes returns the current max upload bytes (Consul KV > env > default).
+func (c *Config) GetMaxUploadBytes() int64 {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetInt64("MAX_UPLOAD_MB", "MAX_UPLOAD_MB", defaultMaxUploadBytes/1024/1024) * 1024 * 1024
+	}
+	return atomic.LoadInt64(&c.MaxUploadBytes)
+}
+
+// GetExtractionTimeout returns the current extraction timeout (Consul KV > env > default).
+func (c *Config) GetExtractionTimeout() time.Duration {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetDuration("EXTRACTION_TIMEOUT", "EXTRACTION_TIMEOUT", defaultExtractionTimeout)
+	}
+	return c.ExtractionTimeout
+}
+
+// GetConcurrency returns the current concurrency (Consul KV > env > default).
+func (c *Config) GetConcurrency() int {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetInt("CONCURRENCY", "CONCURRENCY", 0)
+	}
+	return c.Concurrency
+}
+
+// GetQueueSize returns the current queue size (Consul KV > env > default).
+func (c *Config) GetQueueSize() int {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetInt("QUEUE_SIZE", "QUEUE_SIZE", defaultQueueSize)
+	}
+	return c.QueueSize
+}
+
+// GetMaxInFlight returns the current max in-flight (Consul KV > env > default).
+func (c *Config) GetMaxInFlight() int {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetInt("MAX_IN_FLIGHT", "MAX_IN_FLIGHT", defaultMaxInFlight)
+	}
+	return c.MaxInFlight
+}
+
+// GetAdmissionTimeout returns the current admission timeout (Consul KV > env > default).
+func (c *Config) GetAdmissionTimeout() time.Duration {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetDuration("ADMISSION_TIMEOUT", "ADMISSION_TIMEOUT", defaultAdmissionTimeout)
+	}
+	return c.AdmissionTimeout
+}
+
+// GetCacheTimeout returns the current cache timeout (Consul KV > env > default).
+func (c *Config) GetCacheTimeout() time.Duration {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetDuration("REDIS_TIMEOUT", "REDIS_TIMEOUT", defaultCacheTimeout)
+	}
+	return c.CacheTimeout
+}
+
+// GetCacheTTL returns the current cache TTL (Consul KV > env > default).
+func (c *Config) GetCacheTTL() time.Duration {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetDuration("CACHE_TTL", "CACHE_TTL", defaultCacheTTL)
+	}
+	return c.CacheTTL
+}
+
+// GetErrBaseURL returns the current error base URL (Consul KV > env > default).
+func (c *Config) GetErrBaseURL() string {
+	if c.ConfigWatcher != nil {
+		return c.ConfigWatcher.GetString("ERR_BASE_URL", "ERR_BASE_URL", defaultErrBaseURL)
+	}
+	return c.ErrBaseURL
+}
+
+// applyEnvOverrides applies environment variable overrides with validation (used as fallback).
+func applyEnvOverrides(cfg *Config) error {
+	if raw := os.Getenv("MAX_UPLOAD_MB"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("MAX_UPLOAD_MB must be a positive integer of megabytes (e.g. 25), got %q", raw)
+		}
+		cfg.MaxUploadBytes = v * 1024 * 1024
+	}
+
+	if raw := os.Getenv("EXTRACTION_TIMEOUT"); raw != "" {
+		v, err := time.ParseDuration(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("EXTRACTION_TIMEOUT must be a positive duration (e.g. 30s), got %q", raw)
+		}
+		cfg.ExtractionTimeout = v
+	}
+
+	if raw := os.Getenv("CONCURRENCY"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			return fmt.Errorf("CONCURRENCY must be a non-negative integer (0 or unset for CPU count), got %q", raw)
+		}
+		cfg.Concurrency = v
+	}
+
+	if raw := os.Getenv("QUEUE_SIZE"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("QUEUE_SIZE must be a positive integer: it is how many requests may wait for an extraction slot before the service sheds (e.g. 200), got %q", raw)
+		}
+		cfg.QueueSize = v
+	}
+
+	if raw := os.Getenv("REDIS_TIMEOUT"); raw != "" {
+		v, err := time.ParseDuration(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("REDIS_TIMEOUT must be a positive duration (e.g. 2s), got %q", raw)
+		}
+		cfg.CacheTimeout = v
+	}
+
+	if raw := os.Getenv("MAX_IN_FLIGHT"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("MAX_IN_FLIGHT must be a positive integer (or unset for the default), got %q", raw)
+		}
+		cfg.MaxInFlight = v
+	}
+
+	if raw := os.Getenv("ADMISSION_TIMEOUT"); raw != "" {
+		v, err := time.ParseDuration(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("ADMISSION_TIMEOUT must be a positive duration (e.g. 2s), got %q", raw)
+		}
+		if v >= cfg.ExtractionTimeout {
+			return fmt.Errorf("ADMISSION_TIMEOUT (%s) must be shorter than EXTRACTION_TIMEOUT (%s), got %q", v, cfg.ExtractionTimeout, raw)
+		}
+		cfg.AdmissionTimeout = v
+	}
+
+	if raw := os.Getenv("CACHE_TTL"); raw != "" {
+		v, err := time.ParseDuration(raw)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("CACHE_TTL must be a positive duration (e.g. 24h), got %q", raw)
+		}
+		cfg.CacheTTL = v
+	}
+
+	if raw := os.Getenv("ERR_BASE_URL"); raw != "" {
+		if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://") {
+			return fmt.Errorf("ERR_BASE_URL must be an http(s) URI, got %q", raw)
+		}
+		cfg.ErrBaseURL = raw
+	}
+
+	return nil
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+// ConfigSnapshot provides a point-in-time view of hot-reloadable config.
+type ConfigSnapshot struct {
+	MaxUploadBytes    int64
+	ExtractionTimeout time.Duration
+	Concurrency       int
+	QueueSize         int
+	MaxInFlight       int
+	AdmissionTimeout  time.Duration
+	CacheTimeout      time.Duration
+	CacheTTL          time.Duration
+	ErrBaseURL        string
+}
+
+// Snapshot returns a consistent snapshot of hot-reloadable config.
+func (c *Config) Snapshot() ConfigSnapshot {
+	return ConfigSnapshot{
+		MaxUploadBytes:    c.GetMaxUploadBytes(),
+		ExtractionTimeout: c.GetExtractionTimeout(),
+		Concurrency:       c.GetConcurrency(),
+		QueueSize:         c.GetQueueSize(),
+		MaxInFlight:       c.GetMaxInFlight(),
+		AdmissionTimeout:  c.GetAdmissionTimeout(),
+		CacheTimeout:      c.GetCacheTimeout(),
+		CacheTTL:          c.GetCacheTTL(),
+		ErrBaseURL:        c.GetErrBaseURL(),
+	}
 }
