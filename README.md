@@ -26,12 +26,18 @@ Este repositorio contiene la implementación completa de un microservicio en **G
 
 ```bash
 # Infraestructura compartida (Redis + Traefik)
-docker compose -f microservicio-db/docker-compose.yml up -d
+docker compose -f monolitico/docker-compose.infra.yml up -d
 docker compose -f monolitico/docker-compose.traefik.yml up -d
 
 # Microservicio: 5 réplicas detrás del mismo Traefik
 docker compose -f microservicio-go/docker-compose.yml up -d --scale api=5
 ```
+
+> Redis (caché de extracciones) es infraestructura compartida y se despliega
+> desde `monolitico/docker-compose.infra.yml` (repo del orquestador); este
+> microservicio lo direcciona por URL (`REDIS_URL=redis://redis:6379`) sobre la
+> red compartida `test_network`.
+> Levantar todo con un solo comando: `.\scripts\dev.ps1 up`.
 
 ---
 
