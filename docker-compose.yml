@@ -1,8 +1,9 @@
 # Microservicio Go (extracción de PDF) — se publica únicamente a través de
 # Traefik (misma infraestructura que el monolito). No publica puertos: todo el
-# tráfico entra por el gateway vía labels.
+# tráfico entra por el gateway.
 # Proyecto aislado: evita que `docker compose up` de otra ficha borre los
 # contenedores de las demás (todas comparten la red externa).
+# Service discovery via Consul Catalog (Phase 6) - no Traefik labels needed.
 name: microservicio-go
 
 services:
@@ -58,45 +59,14 @@ services:
       # de algo más de memoria, cubierta por GOMEMLIMIT.
       - GOMEMLIMIT=${GOMEMLIMIT:-850MiB}
       - GOGC=${GOGC:-150}
-    labels:
-      - "traefik.enable=true"
-      # Red que Traefik debe usar para alcanzar este contenedor (la interpola compose).
-      - "traefik.docker.network=${SHARED_NETWORK_NAME:-test_network}"
-      # Router HTTP sobre un host propio: el monolito (miapp) ya ocupa
-      # api.localhost, así que no pisar sus rutas.
-      - "traefik.http.routers.go-extract.rule=Host(`${MICROSERVICE_HOST:-extract.localhost}`)"
-      - "traefik.http.routers.go-extract.entrypoints=web"
-      - "traefik.http.routers.go-extract.service=go-extract"
-      # Middlewares propios del microservicio. `go-errors` va PRIMERO
-      # (outermost) para poder capturar el 429 del rate-limit y el 503 del
-      # circuit-breaker; si fuera el último, la respuesta de error no pasaría
-      # nunca por él. No reutiliza los middlewares de miapp: los límites y el
-      # destino del error son por-servicio.
-      - "traefik.http.routers.go-extract.middlewares=go-errors,go-ratelimit,go-cb"
-      # Rate limit (bucket propio, no compartido con el monolito).
-      - "traefik.http.middlewares.go-ratelimit.ratelimit.average=500"
-      - "traefik.http.middlewares.go-ratelimit.ratelimit.burst=1000"
-      # Circuit breaker propio.
-      - "traefik.http.middlewares.go-cb.circuitbreaker.expression=NetworkErrorRatio() > 0.33"
-      # Errors (RFC 9457): delega 429/503 a este mismo servicio para que
-      # responda problem+json en lugar del texto plano por defecto.
-      - "traefik.http.middlewares.go-errors.errors.status=429,503"
-      - "traefik.http.middlewares.go-errors.errors.query=/traefik/errors/{status}"
-      - "traefik.http.middlewares.go-errors.errors.service=go-extract"
-      # Servicio, puerto interno y healthcheck de balanceo. Nuestro /health no
-      # valida el Host, así que las sondas de Traefik responden 200.
-      - "traefik.http.services.go-extract.loadbalancer.server.port=8080"
-      - "traefik.http.services.go-extract.loadbalancer.healthcheck.path=/api/v1/health"
-      - "traefik.http.services.go-extract.loadbalancer.healthcheck.interval=10s"
-      - "traefik.http.services.go-extract.loadbalancer.healthcheck.timeout=3s"
-    # Healthcheck de Docker: el contenedor se marca unhealthy si el servicio no
-    # responde localmente (independiente del gateway).
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-      start_period: 10s
+      # Consul registration (via local client agent for Connect sidecar support)
+      - CONSUL_HTTP_ADDR=${CONSUL_HTTP_ADDR:-consul-agent-go:8500}
+      - CONSUL_HTTP_TOKEN=${CONSUL_HTTP_TOKEN:-}
+      # Traefik routing via Consul tags (Phase 6)
+      - MICROSERVICE_HOST=${MICROSERVICE_HOST:-extract.localhost}
+    # Healthcheck: Using Consul health checks instead of Docker health check
+    # because distroless base image lacks shell/curl for CMD-SHELL.
+    # Consul registers the service with HTTP health check at /api/v1/health.
     networks:
       - shared-network
     deploy:
