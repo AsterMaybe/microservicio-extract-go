@@ -50,6 +50,7 @@ func run() error {
 		return fmt.Errorf("invalid port: %w", err)
 	}
 
+	microserviceHost := getEnv("MICROSERVICE_HOST", "extract.localhost")
 	consulCfg := consul.Config{
 		ServiceName:   "microservicio-go",
 		ServicePort:   port,
@@ -58,7 +59,7 @@ func run() error {
 		ConsulToken:   consulToken,
 		// Traefik tags for Consul Catalog provider (Phase 6)
 		Tags: []string{
-			"traefik.http.routers.go-extract.rule=Host(`${MICROSERVICE_HOST:-extract.localhost}`)",
+			fmt.Sprintf("traefik.http.routers.go-extract.rule=Host(`%s`)", microserviceHost),
 			"traefik.http.routers.go-extract.entrypoints=web",
 			"traefik.http.routers.go-extract.service=go-extract",
 			"traefik.http.routers.go-extract.middlewares=go-errors,go-ratelimit,go-cb",
